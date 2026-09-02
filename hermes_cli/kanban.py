@@ -387,6 +387,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--idempotency-key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
                                "its id is returned instead of creating a duplicate.")
+    p_create.add_argument("--role", default=None, choices=sorted(kb.VALID_MISSION_ROLES),
+                          help="Mission-lifecycle role marker. 'gate' marks this card as "
+                               "the mission's final acceptance gate; 'umbrella' marks it "
+                               "as the mission's tracking parent. A completed gate with "
+                               "role=gate automatically receives a terminal handoff "
+                               "proposal on its umbrella parent (no silent stop).")
     p_create.add_argument("--max-runtime", default=None,
                           help="Per-task runtime cap. Accepts seconds (300) or "
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
@@ -781,6 +787,28 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Permanently delete already-archived task ids from the board",
     )
 
+    # --- handoff ---
+    p_handoff = sub.add_parser(
+        "handoff",
+        help="Emit terminal mission handoffs for completed gate cards (idempotent)",
+    )
+    p_handoff.add_argument(
+        "task_id",
+        nargs="?",
+        default=None,
+        help="Optional gate task id. When omitted, scans all role=gate done cards.",
+    )
+    p_handoff.add_argument(
+        "--emit-all",
+        action="store_true",
+        help="Scan every done gate card and emit missing handoffs (default when no task_id)",
+    )
+    p_handoff.add_argument(
+        "--json",
+        action="store_true",
+        help="Machine-readable list of emitted gate task ids",
+    )
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -1173,6 +1201,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reopen-review":  _cmd_reopen_review,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "handoff":  _cmd_handoff,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -1686,6 +1715,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            role=getattr(args, "role", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2696,6 +2726,36 @@ def _cmd_archive(args: argparse.Namespace) -> int:
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_handoff(args: argparse.Namespace) -> int:
+    """Emit terminal mission handoffs for completed gate cards (idempotent)."""
+    emitted: list[str] = []
+    with kb.connect_closing() as conn:
+        if args.task_id:
+            task = kb.get_task(conn, args.task_id)
+            if task is None:
+                print(f"unknown task {args.task_id}", file=sys.stderr)
+                return 1
+            if task.role != "gate" or task.status != "done":
+                print(
+                    f"{args.task_id} is not a done role=gate card "
+                    f"(role={task.role!r}, status={task.status}); nothing to hand off",
+                    file=sys.stderr,
+                )
+                return 1
+            if kb.emit_terminal_handoff(conn, task):
+                emitted.append(args.task_id)
+        else:
+            emitted = kb.emit_terminal_handoffs_if_due(conn)
+    if getattr(args, "json", False):
+        print(json.dumps({"emitted": emitted}))
+    elif emitted:
+        for tid in emitted:
+            print(f"Terminal handoff emitted for {tid}")
+    else:
+        print("No terminal handoffs pending (all already emitted or no gate cards)")
+    return 0
 
 
 def _cmd_tail(args: argparse.Namespace) -> int:

@@ -1563,7 +1563,7 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
+                result = _kb.dispatch_once(
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
@@ -1574,6 +1574,25 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
                 )
+                # Terminal mission handoff: after every dispatch tick, scan
+                # for completed role=gate cards and emit their lifecycle
+                # handoff exactly once (idempotent). A final gate ACCEPTED
+                # must transition to an explicit terminal handoff + next-action
+                # proposal, never to a silent stop. Best-effort — a handoff
+                # failure must not break dispatch.
+                try:
+                    emitted = _kb.emit_terminal_handoffs_if_due(conn, board=slug)
+                    if emitted:
+                        logger.info(
+                            "kanban dispatcher: emitted terminal handoff for gate card(s) %s on board %s",
+                            ",".join(emitted), slug,
+                        )
+                except Exception:
+                    logger.exception(
+                        "kanban dispatcher: terminal-handoff scan failed on board %s",
+                        slug,
+                    )
+                return result
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
                     disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())

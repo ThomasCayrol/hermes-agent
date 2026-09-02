@@ -134,6 +134,13 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Mission-lifecycle role markers (opt-in, set at task creation via
+# ``--role``). ``gate`` marks a task as the mission's final acceptance gate;
+# ``umbrella`` marks a task as the mission's tracking parent. Ordinary tasks
+# carry no role. The terminal-handoff observer only fires for ``gate`` cards
+# and writes the handoff onto the mission's ``umbrella`` parent.
+VALID_MISSION_ROLES = {"gate", "umbrella"}
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -1089,6 +1096,12 @@ class Task:
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
+    # Mission-lifecycle role marker (``"gate"`` | ``"umbrella"`` | None).
+    # ``gate``: this card is the mission's final acceptance gate; when it
+    # completes, the terminal-handoff observer emits the mission handoff.
+    # ``umbrella``: this card is the mission's tracking parent (receives
+    # the handoff comment). Ordinary tasks have None.
+    role: Optional[str] = None
     # Force-loaded skills for the worker on this task (passed via
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
@@ -1203,6 +1216,7 @@ class Task:
             current_step_key=(
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
+            role=row["role"] if "role" in keys else None,
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             provider_override=(
@@ -1371,6 +1385,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- them; the dispatcher doesn't consult them for routing yet.
     workflow_template_id TEXT,
     current_step_key     TEXT,
+    -- Mission-lifecycle role marker (NULL for ordinary tasks). Opt-in tag
+    -- set at creation via ``--role``: ``gate`` marks the card as the
+    -- mission's final acceptance gate; ``umbrella`` marks the card as the
+    -- mission's tracking parent. Consumed by the terminal-handoff observer
+    -- so a completed gate transitions to an explicit lifecycle handoff
+    -- instead of silently stopping. Purely advisory to the dispatcher.
+    role                 TEXT,
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
@@ -2689,6 +2710,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "role" not in cols:
+        # Mission-lifecycle role marker (gate | umbrella). NULL on existing
+        # rows — they keep the pre-terminal-handoff behaviour (no observer
+        # fires for them) until a card is explicitly tagged at creation.
+        _add_column_if_missing(conn, "tasks", "role", "role TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3194,6 +3220,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    role: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3251,6 +3278,13 @@ def create_task(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
         )
+    if role is not None:
+        role = str(role).strip().lower() or None
+        if role not in VALID_MISSION_ROLES:
+            raise ValueError(
+                f"role must be one of {sorted(VALID_MISSION_ROLES)} or None, "
+                f"got {role!r}"
+            )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
@@ -3508,8 +3542,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, role
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3535,6 +3569,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        role,
                     ),
                 )
                 for pid in parents:
@@ -4608,6 +4643,365 @@ def recompute_ready(
                 )
                 promoted += 1
     return promoted
+
+
+# ---------------------------------------------------------------------------
+# Terminal mission handoff (post-gate lifecycle)
+# ---------------------------------------------------------------------------
+# A mission's final gate card (role="gate") completing its acceptance run is
+# NOT the end of the mission lifecycle. After the gate is ``done``, the
+# orchestrator must emit a TERMINAL HANDOFF onto the mission umbrella
+# (role="umbrella"): a synthesized summary + recommended next workflow. The
+# functions below are deterministic, read-only-until-emit, and idempotent so
+# a restart / retry never duplicates a handoff.
+
+HANDOFF_MARKER = "HERMES TERMINAL HANDOFF"
+HANDOFF_AUTHOR = "hotelos-cdp"
+HANDOFF_EVENT_KIND = "terminal_handoff"
+
+GATE_ACCEPTED_MARKERS = ("ACCEPT", "PASS")
+GATE_REJECTED_MARKERS = ("REJECT", "CHANGES REQUIRED", "FAIL", "NOT ACCEPTED")
+
+
+def find_mission_parent(conn: sqlite3.Connection, gate_task_id: str) -> Optional[Task]:
+    """Return the mission umbrella for a gate card, if one is tagged.
+
+    Walks the gate's direct parents; returns the first parent whose
+    ``role == 'umbrella'`` (or, absent an umbrella tag, the topmost parent).
+    """
+    parents = conn.execute(
+        "SELECT p.* FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ?",
+        (gate_task_id,),
+    ).fetchall()
+    if not parents:
+        return None
+    tasks = [Task.from_row(r) for r in parents]
+    for t in tasks:
+        if t.role == "umbrella":
+            return t
+    # Fall back to the single parent when there is exactly one (mission graph
+    # convention). With multiple parents and no explicit umbrella, stay None.
+    return tasks[0] if len(tasks) == 1 else None
+
+
+def gate_verdict(conn: sqlite3.Connection, gate: Task) -> Optional[bool]:
+    """Read the gate's verdict from its completed run summary / result.
+
+    Returns True (accepted), False (rejected), or None (unknown / not a
+    verdict). Looks at the last completed run's summary first, then the
+    task-level result.
+    """
+    text = ""
+    run = conn.execute(
+        "SELECT summary FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+        "ORDER BY id DESC LIMIT 1",
+        (gate.id,),
+    ).fetchone()
+    if run and run["summary"]:
+        text += f" {run['summary']}"
+    if gate.result:
+        text += f" {gate.result}"
+    if not text.strip():
+        return None
+    upper = text.upper()
+    if any(m in upper for m in GATE_REJECTED_MARKERS):
+        return False
+    if any(m in upper for m in GATE_ACCEPTED_MARKERS):
+        return True
+    return None
+
+
+def repo_state_for(task: Optional[Task]) -> dict:
+    """Probe the git state of a task's dir workspace (best-effort).
+
+    Returns a dict with ``dirty`` / ``committed`` / ``pushed`` booleans and
+    ``branch``/``head`` when the workspace is a git repo. Any failure returns
+    ``{}`` so the caller can degrade to an approval-required recommendation.
+    """
+    if task is None or task.workspace_kind != "dir" or not task.workspace_path:
+        return {}
+    ws = Path(task.workspace_path)
+    if not ws.is_dir():
+        return {}
+    try:
+        import subprocess
+
+        def _git(*args: str) -> str:
+            out = subprocess.run(
+                ["git", "-C", str(ws), *args],
+                capture_output=True, text=True, timeout=10,
+            )
+            return out.stdout.strip()
+
+        head = _git("rev-parse", "--short", "HEAD")
+        branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+        dirty = bool(_git("status", "--porcelain"))
+        # Count unpushed commits without rev-list @{u} syntax edge cases.
+        ahead = _git("rev-list", "--count", "HEAD", "--not", "--remotes")
+        try:
+            ahead_n = int(ahead) if ahead else 0
+        except ValueError:
+            ahead_n = 0
+        return {
+            "branch": branch or None,
+            "head": head or None,
+            "dirty": bool(dirty),
+            "committed": bool(head),
+            "pushed": ahead_n == 0 and bool(head),
+            "unpushed_commits": ahead_n,
+        }
+    except Exception:
+        return {}
+
+
+def synthesize_terminal_handoff(
+    conn: sqlite3.Connection, gate: Task, umbrella: Optional[Task],
+) -> dict:
+    """Synthesize the terminal mission snapshot (no writes)."""
+    verdict = gate_verdict(conn, gate)
+    repo = repo_state_for(gate) or repo_state_for(umbrella)
+    # Active workers: any running task whose parent chain includes umbrella.
+    active: list[str] = []
+    if umbrella is not None:
+        rows = conn.execute(
+            "SELECT id, assignee, status FROM tasks WHERE status = 'running'"
+        ).fetchall()
+        for row in rows:
+            if row["id"] == umbrella.id:
+                continue
+            linked = conn.execute(
+                "SELECT 1 FROM task_links WHERE child_id = ? AND parent_id = ?",
+                (row["id"], umbrella.id),
+            ).fetchone()
+            if linked:
+                active.append(f"{row['id']} ({row['assignee'] or 'unassigned'})")
+    blockers: list[str] = []
+    if umbrella is not None:
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE status = 'blocked' AND id != ?",
+            (umbrella.id,),
+        ).fetchall():
+            if conn.execute(
+                "SELECT 1 FROM task_links WHERE child_id = ? AND parent_id = ?",
+                (row["id"], umbrella.id),
+            ).fetchone():
+                blockers.append(row["id"])
+    return {
+        "marker": HANDOFF_MARKER,
+        "mission": umbrella.title if umbrella else gate.title,
+        "gate_id": gate.id,
+        "gate_status": gate.status,
+        "verdict": verdict,
+        "active_workers": active,
+        "blockers": blockers,
+        "repo_state": repo,
+    }
+
+
+def emit_terminal_handoff(conn: sqlite3.Connection, gate: Task, board: Optional[str] = None) -> bool:
+    """Emit the terminal handoff for a completed gate card, exactly once.
+
+    Idempotency: scans existing comments on the umbrella for the handoff
+    marker; if already present, returns False without writing. Otherwise
+    posts the synthesized handoff comment onto the umbrella card (source of
+    truth) and records a ``terminal_handoff`` event for gateway notifiers.
+    """
+    umbrella = find_mission_parent(conn, gate.id)
+    target_id = umbrella.id if umbrella is not None else gate.id
+    if any(HANDOFF_MARKER in c.body for c in list_comments(conn, target_id)):
+        return False
+    snapshot = synthesize_terminal_handoff(conn, gate, umbrella)
+    next_action = resolve_next_action(snapshot)
+    verdict_txt = {
+        True: "ACCEPTED", False: "REJECTED / CHANGES REQUIRED", None: "NO EXPLICIT VERDICT",
+    }.get(snapshot["verdict"], "NO EXPLICIT VERDICT")
+    repo_txt = ""
+    if snapshot["repo_state"]:
+        rs = snapshot["repo_state"]
+        repo_txt = (
+            f"\nRepository: branch={rs.get('branch') or '?'} "
+            f"dirty={rs.get('dirty')} committed={rs.get('committed')} "
+            f"pushed={rs.get('pushed')} unpushed={rs.get('unpushed_commits', 0)}"
+        )
+    workers_txt = (
+        ", ".join(snapshot["active_workers"]) if snapshot["active_workers"] else "none"
+    )
+    blockers_txt = (
+        ", ".join(snapshot["blockers"]) if snapshot["blockers"] else "none"
+    )
+    approval_txt = (
+        "\nApproval required: YES — awaiting user approval."
+        if next_action.get("requiresApproval")
+        else "\nApproval required: no (recommendation only)."
+    )
+    seq_txt = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(next_action.get("sequence", [])))
+    body = (
+        f"{HANDOFF_MARKER}\n"
+        f"Mission: {snapshot['mission']}\n"
+        f"Final gate {snapshot['gate_id']}: {verdict_txt}\n"
+        f"Active workers: {workers_txt}\n"
+        f"Unresolved blockers: {blockers_txt}{repo_txt}\n"
+        f"Recommended next workflow: {next_action.get('type', 'NONE')} — "
+        f"{next_action.get('reason', '')}{approval_txt}\n"
+        f"Sequence:\n{seq_txt}\n"
+        f"Recommended next step: {next_action.get('type', 'NONE')}. Awaiting your approval."
+    )
+    with write_txn(conn):
+        add_comment(conn, target_id, HANDOFF_AUTHOR, body)
+        _append_event(
+            conn, target_id, HANDOFF_EVENT_KIND,
+            {
+                "marker": HANDOFF_MARKER,
+                "mission": snapshot["mission"],
+                "gate_id": gate.id,
+                "verdict": verdict_txt,
+                "repo_state": snapshot["repo_state"],
+                "next_action": {
+                    "type": next_action.get("type"),
+                    "requiresApproval": next_action.get("requiresApproval"),
+                    "reason": next_action.get("reason"),
+                },
+            },
+        )
+    return True
+
+
+def emit_terminal_handoffs_if_due(
+    conn: sqlite3.Connection, board: Optional[str] = None,
+) -> list[str]:
+    """Scan for done ``role='gate'`` cards and emit their handoffs once.
+
+    Deterministic + idempotent: returns the list of gate task ids that got a
+    fresh handoff. Cards whose umbrella already carries the marker are
+    skipped. Safe to call on every dispatcher tick.
+    """
+    emitted: list[str] = []
+    for row in conn.execute(
+        "SELECT * FROM tasks WHERE role = 'gate' AND status = 'done'"
+    ).fetchall():
+        gate = Task.from_row(row)
+        try:
+            if emit_terminal_handoff(conn, gate, board=board):
+                emitted.append(gate.id)
+        except Exception:
+            # A failing handoff must never break the dispatcher tick.
+            continue
+    return emitted
+
+
+def resolve_next_action(
+    snapshot: dict,
+    *,
+    approvals_policy: Optional[dict] = None,
+) -> dict:
+    """Resolve the recommended next workflow from a synthesized snapshot.
+
+    Pure + generic (no product-specific logic). Inputs are persisted facts:
+    gate verdict, active workers, blockers, repo state. Output is a
+    structured recommendation::
+
+        {"type": str, "requiresApproval": bool, "reason": str,
+         "sequence": [str, ...]}
+
+    Nothing here performs an action — it only recommends, so authorization
+    boundaries are respected by construction. When any approval-gated step
+    (commit / push / merge) is recommended, ``requiresApproval`` is True and
+    the caller should surface "awaiting your approval".
+    """
+    policy = {
+        "commit": True,
+        "push": True,
+        "merge": True,
+        **(approvals_policy or {}),
+    }
+    blockers = [b for b in (snapshot.get("blockers") or []) if b]
+    active = [w for w in (snapshot.get("active_workers") or []) if w]
+    repo = snapshot.get("repo_state") or {}
+    verdict = snapshot.get("verdict")
+
+    if blockers:
+        return {
+            "type": "AWAITING_DECISION",
+            "requiresApproval": True,
+            "reason": f"Unresolved blocker(s): {', '.join(blockers)} — human decision required.",
+            "sequence": ["Resolve blockers", "Re-run the affected reviews", "Re-run the final gate"],
+        }
+    if active:
+        return {
+            "type": "AWAITING_WORKERS",
+            "requiresApproval": False,
+            "reason": f"Active worker(s) still running: {', '.join(active)}.",
+            "sequence": ["Wait for active workers", "Confirm gate verdict"],
+        }
+    if verdict is False:
+        return {
+            "type": "REMEDIATION",
+            "requiresApproval": False,
+            "reason": "Final gate rejected — remediation required before any delivery.",
+            "sequence": ["Route remediation to the implementer", "Security/DevOps re-review", "Independent QA re-review", "Re-run the final gate"],
+        }
+    if verdict is not True:
+        return {
+            "type": "AWAITING_DECISION",
+            "requiresApproval": True,
+            "reason": "Gate completed without an explicit ACCEPT verdict — confirm before proceeding.",
+            "sequence": ["Inspect gate run summary", "Confirm accept/reject"],
+        }
+
+    # Accepted. Recommend the legitimate next workflow from repo state.
+    dirty = bool(repo.get("dirty"))
+    committed = bool(repo.get("committed"))
+    pushed = bool(repo.get("pushed"))
+    branch = repo.get("branch") or "current branch"
+
+    if dirty:
+        return {
+            "type": "DELIVERY_CHECKPOINT",
+            "requiresApproval": policy.get("commit", True) or policy.get("push", True),
+            "reason": "Final gate accepted; candidate remains uncommitted.",
+            "sequence": [
+                "Verify accepted manifest has not drifted",
+                "Stage the accepted candidate",
+                "Run delivery Git/QA review",
+                "Commit the accepted checkpoint",
+                "Push the feature branch",
+                "Do not merge without separate authorization",
+            ],
+            "nextAction": "DELIVERY_CHECKPOINT",
+        }
+    if committed and not pushed:
+        return {
+            "type": "PUSH_CHECKPOINT",
+            "requiresApproval": policy.get("push", True),
+            "reason": "Final gate accepted and committed; branch not yet pushed.",
+            "sequence": [
+                "Push the current feature branch",
+                "Verify local == remote SHA",
+                "Do not merge without separate authorization",
+            ],
+            "nextAction": "PUSH_CHECKPOINT",
+        }
+    if committed and pushed:
+        return {
+            "type": "INTEGRATION_REVIEW",
+            "requiresApproval": policy.get("merge", True),
+            "reason": "Accepted and pushed — integration/review is next if policy permits.",
+            "sequence": [
+                "Integration review",
+                "Merge decision (requires approval)",
+                "Close the mission",
+            ],
+            "nextAction": "INTEGRATION_REVIEW",
+        }
+    # No repo facts (scratch workspace / not a git repo).
+    return {
+        "type": "CONFIRM_REPO_STATE",
+        "requiresApproval": True,
+        "reason": "Accepted mission with no repository facts — confirm delivery state before proposing a workflow.",
+        "sequence": ["Confirm repository state", "Decide delivery or closure"],
+        "nextAction": "CONFIRM_REPO_STATE",
+    }
 
 
 # ---------------------------------------------------------------------------
