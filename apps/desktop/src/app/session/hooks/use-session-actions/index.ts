@@ -318,6 +318,53 @@ function normalizeNewChatWorkspaceTarget(target: NewChatWorkspaceTarget): NewCha
   return typeof target === 'string' ? target.trim() || null : target
 }
 
+/**
+ * Record the owner of a just-minted session when the create was NOT routed
+ * through an explicit registry agent route. A routed create records its exact
+ * `capturedRoute`; an ambient create through the local primary still lands on
+ * ONE profile's door (the profile the create requested, else the active
+ * gateway's profile). For a NON-default profile that door has no registry
+ * connectionId to tag, but the bare profile is a valid owner — without this
+ * record a fresh session minted on `hotelos-cdp` (etc.) resolves no owner
+ * until its first prompt persists a row, so the tile/resume path fails closed
+ * with SessionOwnerResolutionError ("Session owner could not be resolved").
+ *
+ * Returns the profile recorded, or null when the owner is genuinely ambient
+ * (default profile — the legacy single-backend case) or unknown.
+ */
+export function recordAmbientCreateOwner(
+  storedSessionId: null | string,
+  requestedProfile: string | null | undefined,
+  activeGatewayProfile: string,
+  listed: boolean
+): string | null {
+  const id = storedSessionId?.trim()
+
+  if (!id) {
+    return null
+  }
+
+  const profile = normalizeProfileKey(requestedProfile || activeGatewayProfile)
+
+  if (profile === 'default') {
+    // The default profile is the primary backend's own door; the ambient
+    // socket IS its owner by construction (legacy path keeps working).
+    return null
+  }
+
+  // A LISTED create gets its optimistic row in $sessions, and that row's bare
+  // profile already names the owner (the legacy door's contract). Only an
+  // UNLISTED create (a fresh session tile with no row to name its owner until
+  // the first prompt persists one) needs the hint.
+  if (listed) {
+    return null
+  }
+
+  setSessionOwnerHint(id, { connectionId: '', profile })
+
+  return profile
+}
+
 export function useSessionActions({
   activeSessionId,
   activeSessionIdRef,
@@ -561,6 +608,16 @@ export function useSessionActions({
             // $selectedStoredSessionId) covers it, so a prune or lease release
             // in that gap cannot close the runtime before the first prompt.
             holdSessionOwnerUntilForeground(stored, capturedRoute)
+          } else if (stored) {
+            // An ambient (unrouted) create still lands on ONE profile's door.
+            // Record it so the just-minted session is routable before its first
+            // prompt persists a row (#Mission Control new-session ownership).
+            recordAmbientCreateOwner(
+              stored,
+              $newChatProfile.get() ?? $activeGatewayProfile.get(),
+              $activeGatewayProfile.get(),
+              true // send path: always adds its optimistic listed row below
+            )
           }
         } finally {
           releaseCreateLease()
@@ -745,6 +802,17 @@ export function useSessionActions({
             // moment on, and its socket stays pinned until the tile mounts.
             setSessionOwnerHint(stored, capturedRoute)
             holdSessionOwnerUntilForeground(stored, capturedRoute)
+          } else if (stored) {
+            // Ambient create (no registry route): the create still requested a
+            // profile door (or falls back to the active gateway's). Record the
+            // bare profile as owner so this fresh session tile can resume /
+            // submit before its first prompt persists a row.
+            recordAmbientCreateOwner(
+              stored,
+              $newChatProfile.get() ?? $activeGatewayProfile.get(),
+              $activeGatewayProfile.get(),
+              listed
+            )
           }
         } finally {
           releaseCreateLease()

@@ -189,6 +189,31 @@ describe('session owner hints', () => {
     expect(getSessionOwnerHint('same-session')).toBeUndefined()
   })
 
+  it('records a profile-only owner hint for a profile-door create (no registry connection)', () => {
+    // A session minted through the local profile-door secondary has no
+    // connectionId to tag, but the bare profile names its owning door.
+    setSessionOwnerHint('door-session', { connectionId: '', profile: 'hotelos-cdp' })
+
+    expect(getSessionOwnerHint('door-session')).toMatchObject({ profile: 'hotelos-cdp' })
+    // No row (fresh session, row persists only on first prompt) → the owner
+    // resolves to the BARE PROFILE, which requestGatewayForProfile dials.
+    expect(knownSessionOwner([], 'door-session')).toBe('hotelos-cdp')
+  })
+
+  it('refuses a connection-less hint for the default profile (genuinely ambient)', () => {
+    setSessionOwnerHint('ambient-session', { connectionId: '', profile: 'default' })
+
+    expect(getSessionOwnerHint('ambient-session')).toBeUndefined()
+    expect(knownSessionOwner([], 'ambient-session')).toBeUndefined()
+  })
+
+  it('prefers a real row profile over a profile-only hint, mirroring route precedence', () => {
+    setSessionOwnerHint('rowed-door-session', { connectionId: '', profile: 'stale-door' })
+    const sessions = [session({ id: 'rowed-door-session', profile: 'right-owner' })]
+
+    expect(knownSessionOwner(sessions, 'rowed-door-session')).toBe('right-owner')
+  })
+
   it('bounds owner hints and evicts the oldest scoped identity', () => {
     for (let index = 0; index < 257; index += 1) {
       setSessionOwnerHint(`bounded-${index}`, {
