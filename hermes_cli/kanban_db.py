@@ -4685,30 +4685,79 @@ def find_mission_parent(conn: sqlite3.Connection, gate_task_id: str) -> Optional
     return tasks[0] if len(tasks) == 1 else None
 
 
+GATE_OPENING_WINDOW = 80  # free-text fallback scans only the verdict's opening statement
+
+# Gate-scoped verdict phrases: strong signal because gate workers open their
+# run summary with the gate's OWN verdict (e.g. 'CDP FINAL GATE ACCEPT — …' or
+# 'Gate rejected at read-back: …'). Scanning these first prevents another
+# card's verdict mentioned earlier in the prose ('QA ACCEPT …; however the
+# final gate REJECTED') from overriding the gate's own outcome.
+GATE_ACCEPT_PHRASES = ("GATE ACCEPT", "VERDICT: ACCEPT", "VERDICT ACCEPT")
+GATE_REJECT_PHRASES = ("GATE REJECT", "VERDICT: REJECT", "VERDICT REJECT", "NOT ACCEPTED")
+
+
+def _earliest_marker(text: str, accept_markers, reject_markers) -> Optional[bool]:
+    """Earliest explicit verdict marker wins; missing/ties -> None."""
+    upper = text.upper()
+    best: Optional[bool] = None
+    best_pos: Optional[int] = None
+    for verdict, markers in ((True, accept_markers), (False, reject_markers)):
+        for marker in markers:
+            pos = upper.find(marker)
+            if pos != -1 and (best_pos is None or pos < best_pos):
+                best, best_pos = verdict, pos
+    return best
+
+
+def _verdict_from_marker_text(text: Optional[str]) -> Optional[bool]:
+    """Structured-free verdict scan with gate-scoped phrase priority.
+
+    Within the scanned window: first look for the gate's own verdict phrases
+    ('GATE ACCEPT' / 'GATE REJECT' / verdict statements). If found, the
+    earliest one decides — historical reviewer verdicts mentioned in the same
+    opening (e.g. 'Security REJECT -> remediation') cannot flip the outcome.
+    If no gate-scoped phrase is present, fall back to the earliest plain
+    accept/reject marker.
+    """
+    if not text:
+        return None
+    window = text[:GATE_OPENING_WINDOW]
+    gate_scoped = _earliest_marker(window, GATE_ACCEPT_PHRASES, GATE_REJECT_PHRASES)
+    if gate_scoped is not None:
+        return gate_scoped
+    return _earliest_marker(window, GATE_ACCEPTED_MARKERS, GATE_REJECTED_MARKERS)
+
+
 def gate_verdict(conn: sqlite3.Connection, gate: Task) -> Optional[bool]:
-    """Read the gate's verdict from its completed run summary / result.
+    """Read the gate's verdict, structured fields first.
 
     Returns True (accepted), False (rejected), or None (unknown / not a
-    verdict). Looks at the last completed run's summary first, then the
-    task-level result.
+    verdict). Priority (CDP decision 2026-09-03 after a false-REJECT
+    derivation on the AppStock regression-stabilization gate):
+
+    1. ``task.result`` — the structured completion field, parsed in
+       isolation. It is never concatenated with the run summary, so prose
+       mentioning reviewer history cannot contaminate it.
+    2. The last completed run's summary — but only its opening verdict
+       statement (first ``GATE_OPENING_WINDOW`` characters). Gate workers
+       conventionally open the summary with the verdict line (e.g. 'CDP
+       FINAL GATE ACCEPT — ...'); scanning the whole summary lets
+       historical reviewer verdicts mentioned later (e.g. 'Security REJECT
+       -> remediation') override the gate's own verdict.
     """
-    text = ""
+    if gate.result:
+        verdict = _verdict_from_marker_text(gate.result)
+        if verdict is not None:
+            return verdict
     run = conn.execute(
         "SELECT summary FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
         "ORDER BY id DESC LIMIT 1",
         (gate.id,),
     ).fetchone()
     if run and run["summary"]:
-        text += f" {run['summary']}"
-    if gate.result:
-        text += f" {gate.result}"
-    if not text.strip():
-        return None
-    upper = text.upper()
-    if any(m in upper for m in GATE_REJECTED_MARKERS):
-        return False
-    if any(m in upper for m in GATE_ACCEPTED_MARKERS):
-        return True
+        verdict = _verdict_from_marker_text(run["summary"][:GATE_OPENING_WINDOW])
+        if verdict is not None:
+            return verdict
     return None
 
 
@@ -4799,17 +4848,59 @@ def synthesize_terminal_handoff(
     }
 
 
-def emit_terminal_handoff(conn: sqlite3.Connection, gate: Task, board: Optional[str] = None) -> bool:
+def _last_handoff_verdict(conn: sqlite3.Connection, task_id: str) -> Optional[bool]:
+    """Structured verdict stored by the most recent terminal handoff event."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, HANDOFF_EVENT_KIND),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return None
+    verdict = (payload or {}).get("verdict")
+    if verdict == "ACCEPTED":
+        return True
+    if verdict and str(verdict).startswith("REJECT"):
+        return False
+    return None
+
+
+def emit_terminal_handoff(
+    conn: sqlite3.Connection,
+    gate: Task,
+    board: Optional[str] = None,
+    *,
+    recompute: bool = False,
+) -> bool:
     """Emit the terminal handoff for a completed gate card, exactly once.
 
     Idempotency: scans existing comments on the umbrella for the handoff
     marker; if already present, returns False without writing. Otherwise
     posts the synthesized handoff comment onto the umbrella card (source of
     truth) and records a ``terminal_handoff`` event for gateway notifiers.
+
+    ``recompute=True`` re-derives the snapshot from current persisted state
+    and, when the freshly derived verdict differs from the verdict stored by
+    the most recent handoff event, appends a corrective handoff comment +
+    event (marked RECOMPUTED). The original handoff record is preserved for
+    audit; consumers that prefer the newest event see the corrected verdict.
+    When the derived verdict matches the stored one (or no prior handoff
+    exists) behaviour is unchanged: no second emission.
     """
     umbrella = find_mission_parent(conn, gate.id)
     target_id = umbrella.id if umbrella is not None else gate.id
-    if any(HANDOFF_MARKER in c.body for c in list_comments(conn, target_id)):
+    prior = list_comments(conn, target_id)
+    has_marker = any(HANDOFF_MARKER in c.body for c in prior)
+    if recompute and has_marker:
+        derived = gate_verdict(conn, gate)
+        stored = _last_handoff_verdict(conn, target_id)
+        if derived is None or stored == derived:
+            return False
+    elif not recompute and has_marker:
         return False
     snapshot = synthesize_terminal_handoff(conn, gate, umbrella)
     next_action = resolve_next_action(snapshot)
@@ -4836,8 +4927,14 @@ def emit_terminal_handoff(conn: sqlite3.Connection, gate: Task, board: Optional[
         else "\nApproval required: no (recommendation only)."
     )
     seq_txt = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(next_action.get("sequence", [])))
+    marker_line = HANDOFF_MARKER
+    if recompute and has_marker:
+        marker_line = (
+            f"{HANDOFF_MARKER} (RECOMPUTED — structured verdict supersedes "
+            "the prior derivation)"
+        )
     body = (
-        f"{HANDOFF_MARKER}\n"
+        f"{marker_line}\n"
         f"Mission: {snapshot['mission']}\n"
         f"Final gate {snapshot['gate_id']}: {verdict_txt}\n"
         f"Active workers: {workers_txt}\n"
@@ -4862,6 +4959,7 @@ def emit_terminal_handoff(conn: sqlite3.Connection, gate: Task, board: Optional[
                     "requiresApproval": next_action.get("requiresApproval"),
                     "reason": next_action.get("reason"),
                 },
+                "recomputed": bool(recompute and has_marker),
             },
         )
     return True

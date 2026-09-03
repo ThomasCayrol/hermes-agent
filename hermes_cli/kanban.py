@@ -808,6 +808,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         action="store_true",
         help="Machine-readable list of emitted gate task ids",
     )
+    p_handoff.add_argument(
+        "--recompute",
+        action="store_true",
+        help="Re-derive the handoff from current persisted state and append a "
+        "corrective RECOMPUTED handoff when the structured verdict now differs "
+        "from the stored one (original record preserved for audit)",
+    )
 
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
@@ -2744,7 +2751,9 @@ def _cmd_handoff(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            if kb.emit_terminal_handoff(conn, task):
+            if kb.emit_terminal_handoff(
+                conn, task, recompute=bool(getattr(args, "recompute", False))
+            ):
                 emitted.append(args.task_id)
         else:
             emitted = kb.emit_terminal_handoffs_if_due(conn)
