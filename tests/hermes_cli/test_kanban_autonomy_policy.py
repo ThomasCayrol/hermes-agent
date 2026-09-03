@@ -161,8 +161,9 @@ def test_verdict_precedence_structured_result_over_summary(conn):
 
 
 def test_verdict_metadata_json_string_and_verdicts_list(conn):
-    """metadata may arrive as a JSON string (sqlite column) and may carry a
-    unanimous ``verdicts`` list."""
+    """metadata may arrive as a JSON string (sqlite column), may carry a
+    unanimous ``verdicts`` list, and real gate runs persist the structured
+    ``gate_outcome`` field."""
     assert kb._verdict_from_run_metadata('{"verdict": "ACCEPTED"}') is True
     assert kb._verdict_from_run_metadata('{"verdict": "CHANGES_REQUIRED"}') is False
     assert kb._verdict_from_run_metadata({"verdicts": ["ACCEPTED", "PASS"]}) is True
@@ -170,6 +171,12 @@ def test_verdict_metadata_json_string_and_verdicts_list(conn):
     assert kb._verdict_from_run_metadata({"summary": "ACCEPTED here"}) is None
     assert kb._verdict_from_run_metadata("not json {") is None
     assert kb._verdict_from_run_metadata(None) is None
+    # Real gate runs persist gate_outcome (e.g. the AppStock final gate).
+    assert kb._verdict_from_run_metadata({"gate_outcome": "ACCEPT"}) is True
+    assert kb._verdict_from_run_metadata({"gate_outcome": "REJECT"}) is False
+    assert kb._verdict_from_run_metadata(
+        {"gate_outcome": "REJECT", "verdict": "ACCEPTED"}
+    ) is True  # explicit verdict key outranks the alias
 
 
 def test_verdict_canonical_token_not_substring(conn):

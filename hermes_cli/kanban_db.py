@@ -4753,9 +4753,12 @@ def _canonical_verdict(value: object) -> Optional[bool]:
 def _verdict_from_run_metadata(metadata: object) -> Optional[bool]:
     """Structured persisted verdict from a completed run's metadata.
 
-    The canonical key is ``verdict`` (e.g. ``{"verdict": "ACCEPTED"}``); a
-    ``verdicts`` list is accepted for multi-reviewer runs but must be
-    unanimous. metadata may arrive as a dict or a JSON string.
+    Canonical keys, in order: ``verdict``, then ``gate_outcome`` (the
+    structured outcome field real gate runs persist, e.g.
+    ``{"gate_outcome": "ACCEPT"}``); a ``verdicts`` list is accepted for
+    multi-reviewer runs but must be unanimous. Only exact canonical tokens
+    count (see :func:`_canonical_verdict`) — never substring matches.
+    metadata may arrive as a dict or a JSON string.
     """
     if isinstance(metadata, str):
         try:
@@ -4764,8 +4767,9 @@ def _verdict_from_run_metadata(metadata: object) -> Optional[bool]:
             return None
     if not isinstance(metadata, dict):
         return None
-    if "verdict" in metadata:
-        return _canonical_verdict(metadata.get("verdict"))
+    for key in ("verdict", "gate_outcome"):
+        if key in metadata:
+            return _canonical_verdict(metadata.get(key))
     if isinstance(metadata.get("verdicts"), list) and metadata["verdicts"]:
         parsed = [_canonical_verdict(v) for v in metadata["verdicts"]]
         if parsed and all(v is True for v in parsed):
