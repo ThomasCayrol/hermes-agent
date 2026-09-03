@@ -4685,30 +4685,180 @@ def find_mission_parent(conn: sqlite3.Connection, gate_task_id: str) -> Optional
     return tasks[0] if len(tasks) == 1 else None
 
 
+GATE_OPENING_WINDOW = 80  # free-text fallback scans only the verdict's opening statement
+
+# Canonical structured verdict tokens for ``task_runs.metadata['verdict']``
+# and other explicit channels. Normalised case-insensitively; only exact
+# tokens count — never substrings.
+VERDICT_ACCEPT_TOKENS = frozenset({"ACCEPTED", "ACCEPT", "PASS", "PASSED"})
+VERDICT_REJECT_TOKENS = frozenset({
+    "REJECTED", "REJECT", "CHANGES REQUIRED", "CHANGES_REQUIRED",
+    "FAIL", "FAILED", "NOT ACCEPTED", "NOT_ACCEPTED",
+})
+
+# Free-text markers are matched as bounded phrases, NOT raw substrings, so a
+# token inside a stronger phrase cannot double-count ("NOT ACCEPTED" contains
+# "ACCEPT"; "unacceptable" contains "ACCEPT" but is not a verdict). ``PASS`` /
+# ``FAIL`` still match as prefixes inside PASSED/FAILED/FAILING via alternates.
+_PLAIN_ACCEPT_RE = re.compile(r"\bACCEPT(?:ED)?\b|\bPASS(?:ED)?\b")
+_PLAIN_REJECT_RE = re.compile(
+    r"\bNOT ACCEPTED\b|\bCHANGES REQUIRED\b|\bREJECT(?:ED)?\b|\bFAIL(?:ED|ING|URE)?\b"
+)
+# Gate-scoped verdict phrases: strong signal because gate workers open their
+# run summary with the gate's OWN verdict (e.g. 'CDP FINAL GATE ACCEPT — …' or
+# 'Gate rejected at read-back: …'). Scanning these first prevents another
+# card's verdict mentioned in the same opening ('QA ACCEPT …; however the
+# final gate REJECTED') from overriding the gate's own outcome.
+_GATE_ACCEPT_RE = re.compile(
+    r"\bGATE (?:ACCEPT(?:ED)?|PASS(?:ED)?)\b|\bVERDICT:? (?:ACCEPT(?:ED)?|PASS(?:ED)?)\b"
+)
+_GATE_REJECT_RE = re.compile(
+    r"\bGATE REJECT(?:ED)?\b|\bVERDICT:? (?:REJECT(?:ED)?|NOT ACCEPTED)\b"
+)
+
+GATE_ACCEPT_PHRASES = ("GATE ACCEPT", "GATE PASS", "VERDICT: ACCEPT", "VERDICT ACCEPT")
+GATE_REJECT_PHRASES = (
+    "GATE REJECT", "VERDICT: REJECT", "VERDICT REJECT", "VERDICT: NOT ACCEPTED",
+)
+
+
+def _polarity(accept_hits: int, reject_hits: int) -> Optional[bool]:
+    """Single-polarity evidence decides; mixed/absent evidence stays None."""
+    if accept_hits and not reject_hits:
+        return True
+    if reject_hits and not accept_hits:
+        return False
+    return None
+
+
+def _canonical_verdict(value: object) -> Optional[bool]:
+    """Normalise an explicit verdict token (structured channels only).
+
+    Accepts exact canonical tokens case-insensitively (with and without the
+    underscore spelling of multi-word tokens). Anything else — including a
+    prose sentence containing the token — is NOT a structured verdict.
+    """
+    if not isinstance(value, str):
+        return None
+    token = value.strip().upper()
+    if not token:
+        return None
+    if token in VERDICT_ACCEPT_TOKENS:
+        return True
+    if token in VERDICT_REJECT_TOKENS:
+        return False
+    return None
+
+
+def _verdict_from_run_metadata(metadata: object) -> Optional[bool]:
+    """Structured persisted verdict from a completed run's metadata.
+
+    Canonical keys, in order: ``verdict``, then ``gate_outcome`` (the
+    structured outcome field real gate runs persist, e.g.
+    ``{"gate_outcome": "ACCEPT"}``); a ``verdicts`` list is accepted for
+    multi-reviewer runs but must be unanimous. Only exact canonical tokens
+    count (see :func:`_canonical_verdict`) — never substring matches.
+    metadata may arrive as a dict or a JSON string.
+    """
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            return None
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("verdict", "gate_outcome"):
+        if key in metadata:
+            return _canonical_verdict(metadata.get(key))
+    if isinstance(metadata.get("verdicts"), list) and metadata["verdicts"]:
+        parsed = [_canonical_verdict(v) for v in metadata["verdicts"]]
+        if parsed and all(v is True for v in parsed):
+            return True
+        if parsed and all(v is False for v in parsed):
+            return False
+    return None
+
+
+def _verdict_from_marker_text(
+    text: Optional[str], *, window: bool = True,
+) -> Optional[bool]:
+    """Structured-free verdict scan with gate-scoped phrase priority.
+
+    Scans the text (or its opening ``GATE_OPENING_WINDOW`` characters when
+    ``window=True`` — the free-text fallback path). Within the scanned
+    region: first look for the gate's own verdict phrases ('GATE ACCEPT' /
+    'GATE REJECT' / verdict statements). Historical reviewer verdicts
+    mentioned in the opening (e.g. 'Security REJECT -> remediation') cannot
+    flip the outcome because gate-scoped evidence outranks plain markers.
+    If no gate-scoped phrase is present, plain accept/reject markers decide
+    — but ONLY when the opening is single-polarity. Mixed accept+reject
+    evidence in a free-text opening is structurally ambiguous: return None
+    (fail closed toward a human decision) instead of guessing.
+    """
+    if not text:
+        return None
+    region = text[:GATE_OPENING_WINDOW] if window else text
+    upper = region.upper()
+    gate_accept = len(list(_GATE_ACCEPT_RE.finditer(upper)))
+    gate_reject = len(list(_GATE_REJECT_RE.finditer(upper)))
+    verdict = _polarity(gate_accept, gate_reject)
+    if verdict is not None:
+        return verdict
+    # Plain markers: drop accept hits swallowed inside a negative phrase
+    # ("ACCEPT" inside "NOT ACCEPTED") before the polarity test.
+    reject_spans = [m.span() for m in _PLAIN_REJECT_RE.finditer(upper)]
+    accept_spans: list[tuple[int, int]] = []
+    for m in _PLAIN_ACCEPT_RE.finditer(upper):
+        a_start, a_end = m.span()
+        if not any(a_start >= rs and a_end <= re_ for rs, re_ in reject_spans):
+            accept_spans.append((a_start, a_end))
+    return _polarity(len(accept_spans), len(reject_spans))
+
+
 def gate_verdict(conn: sqlite3.Connection, gate: Task) -> Optional[bool]:
-    """Read the gate's verdict from its completed run summary / result.
+    """Read the gate's verdict, strictly structured-first.
 
     Returns True (accepted), False (rejected), or None (unknown / not a
-    verdict). Looks at the last completed run's summary first, then the
-    task-level result.
+    verdict). Precedence (CDP decision 2026-09-03 after a false-REJECT
+    derivation on the AppStock regression-stabilization gate; extended for
+    the autonomous next-action policy):
+
+    1. **Structured persisted verdict/status fields** — the last completed
+       run's ``metadata`` JSON carrying a canonical ``verdict`` token
+       (``{"verdict": "ACCEPTED"}``). Never substring-matched.
+    2. **Explicit canonical structured result** — ``task.result``, parsed in
+       isolation. It is never concatenated with the run summary, so prose
+       mentioning reviewer history cannot contaminate it.
+    3. **Carefully parsed legacy text fallback** — the last completed run's
+       summary, but only its opening verdict statement (first
+       ``GATE_OPENING_WINDOW`` characters). Gate workers conventionally open
+       the summary with the verdict line (e.g. 'CDP FINAL GATE ACCEPT — …');
+       scanning the whole summary lets historical reviewer verdicts
+       mentioned later (e.g. 'Security REJECT -> remediation') override the
+       gate's own verdict. Ambiguous (mixed-polarity) openings resolve to
+       None — fail closed — never to an arbitrary substring match.
+
+    Gate completions should persist the verdict explicitly via
+    ``complete_task(..., metadata={"verdict": "ACCEPTED"})`` so derivation
+    never depends on prose.
     """
-    text = ""
     run = conn.execute(
-        "SELECT summary FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
-        "ORDER BY id DESC LIMIT 1",
+        "SELECT summary, metadata FROM task_runs WHERE task_id = ? "
+        "AND outcome = 'completed' ORDER BY id DESC LIMIT 1",
         (gate.id,),
     ).fetchone()
-    if run and run["summary"]:
-        text += f" {run['summary']}"
+    if run:
+        meta_verdict = _verdict_from_run_metadata(run["metadata"] if run else None)
+        if meta_verdict is not None:
+            return meta_verdict
     if gate.result:
-        text += f" {gate.result}"
-    if not text.strip():
-        return None
-    upper = text.upper()
-    if any(m in upper for m in GATE_REJECTED_MARKERS):
-        return False
-    if any(m in upper for m in GATE_ACCEPTED_MARKERS):
-        return True
+        verdict = _verdict_from_marker_text(gate.result, window=False)
+        if verdict is not None:
+            return verdict
+    if run and run["summary"]:
+        verdict = _verdict_from_marker_text(run["summary"], window=True)
+        if verdict is not None:
+            return verdict
     return None
 
 
@@ -4799,23 +4949,86 @@ def synthesize_terminal_handoff(
     }
 
 
-def emit_terminal_handoff(conn: sqlite3.Connection, gate: Task, board: Optional[str] = None) -> bool:
+def _last_handoff_verdict(conn: sqlite3.Connection, task_id: str) -> Optional[bool]:
+    """Structured verdict stored by the most recent terminal handoff event."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, HANDOFF_EVENT_KIND),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return None
+    verdict = (payload or {}).get("verdict")
+    if verdict == "ACCEPTED":
+        return True
+    if verdict and str(verdict).startswith("REJECT"):
+        return False
+    return None
+
+
+def emit_terminal_handoff(
+    conn: sqlite3.Connection,
+    gate: Task,
+    board: Optional[str] = None,
+    *,
+    recompute: bool = False,
+    autonomy_policy: Optional[dict] = None,
+) -> bool:
     """Emit the terminal handoff for a completed gate card, exactly once.
 
     Idempotency: scans existing comments on the umbrella for the handoff
     marker; if already present, returns False without writing. Otherwise
     posts the synthesized handoff comment onto the umbrella card (source of
     truth) and records a ``terminal_handoff`` event for gateway notifiers.
+    The event payload carries the full structured end-of-step decision —
+    analysis, next action, decision class (AUTO / APPROVAL_REQUIRED),
+    rationale, and action status — so Mission Control can render the
+    decision and a restarted orchestrator never needs to re-derive it.
+
+    When the decision class is AUTO, a deduplicated ``auto_continue`` event
+    is recorded on the same card as the persisted continuation intent: a
+    restart / replay that re-scans the board sees the existing handoff and
+    emits nothing new, so an auto-launched workflow is never duplicated.
+
+    ``recompute=True`` re-derives the snapshot from current persisted state
+    and, when the freshly derived verdict differs from the verdict stored by
+    the most recent handoff event, appends a corrective handoff comment +
+    event (marked RECOMPUTED). The original handoff record is preserved for
+    audit; consumers that prefer the newest event see the corrected verdict.
+    When the derived verdict matches the stored one (or no prior handoff
+    exists) behaviour is unchanged: no second emission.
+
+    ``autonomy_policy`` is the normalised operator autonomy policy (see
+    :func:`autonomy_policy_from_config`); None = built-in auto policy.
     """
     umbrella = find_mission_parent(conn, gate.id)
     target_id = umbrella.id if umbrella is not None else gate.id
-    if any(HANDOFF_MARKER in c.body for c in list_comments(conn, target_id)):
+    prior = list_comments(conn, target_id)
+    has_marker = any(HANDOFF_MARKER in c.body for c in prior)
+    if recompute and has_marker:
+        derived = gate_verdict(conn, gate)
+        stored = _last_handoff_verdict(conn, target_id)
+        if derived is None or stored == derived:
+            return False
+    elif not recompute and has_marker:
         return False
     snapshot = synthesize_terminal_handoff(conn, gate, umbrella)
-    next_action = resolve_next_action(snapshot)
+    next_action = resolve_next_action(
+        snapshot, autonomy_policy=autonomy_policy,
+    )
     verdict_txt = {
         True: "ACCEPTED", False: "REJECTED / CHANGES REQUIRED", None: "NO EXPLICIT VERDICT",
     }.get(snapshot["verdict"], "NO EXPLICIT VERDICT")
+    decision_class = next_action.get("decisionClass") or APPROVAL_REQUIRED
+    action_status = (
+        ACTION_STATUS_STARTING
+        if decision_class == AUTO
+        else ACTION_STATUS_AWAITING_APPROVAL
+    )
     repo_txt = ""
     if snapshot["repo_state"]:
         rs = snapshot["repo_state"]
@@ -4830,22 +5043,47 @@ def emit_terminal_handoff(conn: sqlite3.Connection, gate: Task, board: Optional[
     blockers_txt = (
         ", ".join(snapshot["blockers"]) if snapshot["blockers"] else "none"
     )
+    analysis = (
+        f"Final gate {snapshot['gate_id']} completed: {verdict_txt}. "
+        f"Active workers: {workers_txt}; unresolved blockers: {blockers_txt}."
+    )
+    decision_txt = (
+        f"{decision_class} — Hermes continues automatically."
+        if decision_class == AUTO
+        else f"{decision_class} — awaiting operator approval."
+    )
     approval_txt = (
-        "\nApproval required: YES — awaiting user approval."
+        "\nApproval required: YES — this action crosses the approval boundary."
         if next_action.get("requiresApproval")
-        else "\nApproval required: no (recommendation only)."
+        else "\nApproval required: no (low-risk, in-scope action)."
     )
     seq_txt = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(next_action.get("sequence", [])))
+    marker_line = HANDOFF_MARKER
+    if recompute and has_marker:
+        marker_line = (
+            f"{HANDOFF_MARKER} (RECOMPUTED — structured verdict supersedes "
+            "the prior derivation)"
+        )
+    closing_txt = (
+        f"Next step: {next_action.get('type', 'NONE')} — started automatically; "
+        "no approval needed."
+        if decision_class == AUTO
+        else f"Next step: {next_action.get('type', 'NONE')}. Awaiting your approval."
+    )
     body = (
-        f"{HANDOFF_MARKER}\n"
+        f"{marker_line}\n"
         f"Mission: {snapshot['mission']}\n"
         f"Final gate {snapshot['gate_id']}: {verdict_txt}\n"
         f"Active workers: {workers_txt}\n"
         f"Unresolved blockers: {blockers_txt}{repo_txt}\n"
-        f"Recommended next workflow: {next_action.get('type', 'NONE')} — "
-        f"{next_action.get('reason', '')}{approval_txt}\n"
+        f"Analysis: {analysis}\n"
+        f"Next action: {next_action.get('type', 'NONE')} — "
+        f"{next_action.get('reason', '')}\n"
+        f"Decision class: {decision_txt}\n"
+        f"Rationale: {next_action.get('rationale', '')}{approval_txt}\n"
+        f"Action status: {action_status}\n"
         f"Sequence:\n{seq_txt}\n"
-        f"Recommended next step: {next_action.get('type', 'NONE')}. Awaiting your approval."
+        f"{closing_txt}"
     )
     with write_txn(conn):
         add_comment(conn, target_id, HANDOFF_AUTHOR, body)
@@ -4862,19 +5100,45 @@ def emit_terminal_handoff(conn: sqlite3.Connection, gate: Task, board: Optional[
                     "requiresApproval": next_action.get("requiresApproval"),
                     "reason": next_action.get("reason"),
                 },
+                "decision": {
+                    "actionType": next_action.get("type"),
+                    "decisionClass": decision_class,
+                    "requiresApproval": bool(next_action.get("requiresApproval")),
+                    "rationale": next_action.get("rationale"),
+                    "actionStatus": action_status,
+                    "analysis": analysis,
+                    "autonomyMode": (autonomy_policy or DEFAULT_AUTONOMY_POLICY).get("mode"),
+                },
+                "autoContinue": decision_class == AUTO,
+                "recomputed": bool(recompute and has_marker),
             },
         )
+        if decision_class == AUTO:
+            _append_event(
+                conn, target_id, AUTO_CONTINUE_EVENT_KIND,
+                {
+                    "gate_id": gate.id,
+                    "actionType": next_action.get("type"),
+                    "decisionClass": AUTO,
+                    "actionStatus": action_status,
+                },
+            )
     return True
 
 
 def emit_terminal_handoffs_if_due(
-    conn: sqlite3.Connection, board: Optional[str] = None,
+    conn: sqlite3.Connection,
+    board: Optional[str] = None,
+    *,
+    autonomy_policy: Optional[dict] = None,
 ) -> list[str]:
     """Scan for done ``role='gate'`` cards and emit their handoffs once.
 
     Deterministic + idempotent: returns the list of gate task ids that got a
     fresh handoff. Cards whose umbrella already carries the marker are
-    skipped. Safe to call on every dispatcher tick.
+    skipped, so restart/replay across a gateway restart never duplicates a
+    handoff or its recorded auto-continuation. Safe to call on every
+    dispatcher tick.
     """
     emitted: list[str] = []
     for row in conn.execute(
@@ -4882,7 +5146,9 @@ def emit_terminal_handoffs_if_due(
     ).fetchall():
         gate = Task.from_row(row)
         try:
-            if emit_terminal_handoff(conn, gate, board=board):
+            if emit_terminal_handoff(
+                conn, gate, board=board, autonomy_policy=autonomy_policy,
+            ):
                 emitted.append(gate.id)
         except Exception:
             # A failing handoff must never break the dispatcher tick.
@@ -4890,75 +5156,379 @@ def emit_terminal_handoffs_if_due(
     return emitted
 
 
+# ---------------------------------------------------------------------------
+# Autonomous next-action policy (decision classes)
+# ---------------------------------------------------------------------------
+# Every resolved next action carries an explicit decision class — AUTO or
+# APPROVAL_REQUIRED — so the operator policy is machine-readable, never
+# implicit prose. Classification is a PURE function of (action identity,
+# repository context, operator policy): the board records the decision;
+# Mission Control renders it; the orchestrator (Hermes) executes AUTO actions
+# and stops for APPROVAL_REQUIRED ones. Defaults are conservative:
+# unknown actions and unverifiable contexts FAIL CLOSED to APPROVAL_REQUIRED.
+
+AUTO = "AUTO"
+APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
+
+ACTION_STATUS_STARTING = "STARTING"
+ACTION_STATUS_EXECUTED = "EXECUTED"
+ACTION_STATUS_AWAITING_APPROVAL = "AWAITING_APPROVAL"
+
+AUTO_CONTINUE_EVENT_KIND = "auto_continue"
+
+AUTONOMY_MODE_AUTO = "auto"
+AUTONOMY_MODE_CHECKPOINT = "checkpoint"
+
+DEFAULT_AUTONOMY_POLICY: dict = {
+    "mode": AUTONOMY_MODE_AUTO,      # advance through low-risk workflow
+    "approvals": {},                  # {"ACTION_TYPE": "auto"|"required"}
+    "protectedBranches": [],          # extra canonical branches beyond main/master
+}
+CANONICAL_BRANCH_NAMES = ("main", "master")
+
+# Resolver + orchestrator action identities that are internal to the current
+# mission, reversible, non-destructive, and inside already-approved scope
+# (Hermes autonomy policy, spec §3 defaults).
+_AUTO_ACTION_TYPES = frozenset({
+    "REMEDIATION",
+    "AWAITING_WORKERS",
+    "RE_RUN_SECURITY_REVIEW",
+    "RE_RUN_DEVOPS_REVIEW",
+    "RE_RUN_QA",
+    "RE_RUN_FINAL_GATE",
+    "RE_RUN_REVIEW",
+    "RE_RUN_GATE",
+    "RUN_TESTS",
+    "TESTS",
+    "AUDIT",
+    "BROWSER_VERIFICATION",
+    "KANBAN_CARD_CREATE",
+    "KANBAN_CARD_UPDATE",
+    "CREATE_FEATURE_BRANCH",
+    "BRANCH_COMMIT",
+    "DOCUMENTATION",
+    "WORKER_RETRY",
+    "EPHEMERAL_CLEANUP",
+})
+
+# Actions that cross the operator-approval boundary: canonical-state
+# mutation, destructive or irreversible operations, security/product
+# direction changes, external impact, or decisions a model cannot safely
+# make (Hermes autonomy policy, spec §4).
+_APPROVAL_ACTION_TYPES = frozenset({
+    "MERGE_MAIN",
+    "MERGE",
+    "PUSH_MAIN",
+    "FORCE_PUSH",
+    "HISTORY_REWRITE",
+    "DELETE_BRANCH",
+    "DELETE_TAG",
+    "DELETE_KANBAN_EVIDENCE",
+    "DESTRUCTIVE_MIGRATION",
+    "DESTRUCTIVE_DB_MIGRATION",
+    "IRREVERSIBLE_PRODUCTION_OP",
+    "SECURITY_POLICY_CHANGE",
+    "ARCHITECTURE_REDESIGN",
+    "PRODUCT_SCOPE_EXPANSION",
+    "PRODUCT_DIRECTION_CHOICE",
+    "PRODUCTION_DEPLOYMENT",
+    "EXTERNAL_PUBLICATION",
+    "RELEASE",
+    # Resolver outputs that intentionally stop for a human:
+    "AWAITING_DECISION",
+    "CONFIRM_REPO_STATE",
+    "INTEGRATION_REVIEW",  # its milestone is a merge decision on canonical state
+})
+
+# Actions whose approval depends on whether they touch canonical state
+# (branch context required).
+_BRANCH_CONTEXT_ACTION_TYPES = frozenset({
+    "COMMIT", "PUSH", "DELIVERY_CHECKPOINT", "PUSH_CHECKPOINT",
+})
+
+# Legacy ``approvals_policy`` used verb keys (commit/push/merge) while the
+# resolver emits workflow identities (DELIVERY_CHECKPOINT/…). Alias map so a
+# legacy override still reaches the identities it used to gate.
+_LEGACY_VERB_ALIASES = {
+    "COMMIT": ("COMMIT", "BRANCH_COMMIT", "DELIVERY_CHECKPOINT"),
+    "PUSH": ("PUSH", "PUSH_MAIN", "PUSH_CHECKPOINT", "DELIVERY_CHECKPOINT"),
+    "MERGE": ("MERGE", "MERGE_MAIN", "INTEGRATION_REVIEW"),
+}
+
+
+def _branch_is_canonical(branch: Optional[str], policy: dict) -> bool:
+    if not branch:
+        return False
+    protected = set(CANONICAL_BRANCH_NAMES) | set(
+        policy.get("protectedBranches") or []
+    )
+    return branch.strip() in protected
+
+
+def autonomy_policy_from_config(config: Optional[dict]) -> dict:
+    """Normalise the persisted operator autonomy policy (config.yaml).
+
+    Reads ``kanban.autonomy``::
+
+        kanban:
+          autonomy:
+            mode: auto        # auto | checkpoint
+            approvals: {}     # {"ACTION_TYPE": "auto" | "required"}
+            protectedBranches: []
+
+    ``mode: auto`` (default) advances through the most logical low-risk
+    workflow and requests approval only for material/high-impact decisions.
+    ``mode: checkpoint`` requests approval at every gate/transition.
+    ``approvals`` overrides per action identity (highest precedence).
+    Unknown keys / invalid values fall back to defaults — the config is
+    advisory, never load-bearing for safety (unknown actions still fail
+    closed to APPROVAL_REQUIRED).
+    """
+    kanban = config.get("kanban") if isinstance(config, dict) else None
+    raw = kanban.get("autonomy") if isinstance(kanban, dict) else None
+    policy = dict(DEFAULT_AUTONOMY_POLICY)
+    if not isinstance(raw, dict):
+        return policy
+    mode = str(raw.get("mode", AUTONOMY_MODE_AUTO)).strip().lower()
+    if mode in (AUTONOMY_MODE_AUTO, AUTONOMY_MODE_CHECKPOINT):
+        policy["mode"] = mode
+    approvals = raw.get("approvals")
+    if isinstance(approvals, dict):
+        normalized: dict[str, str] = {}
+        for key, value in approvals.items():
+            v = str(value).strip().lower()
+            if v in ("auto", "required"):
+                normalized[str(key)] = v
+        policy["approvals"] = normalized
+    protected = raw.get("protectedBranches")
+    if isinstance(protected, (list, tuple)):
+        policy["protectedBranches"] = [
+            str(b).strip() for b in protected if str(b).strip()
+        ]
+    return policy
+
+
+def classify_next_action(
+    action_type: Optional[str],
+    *,
+    branch: Optional[str] = None,
+    policy: Optional[dict] = None,
+) -> dict:
+    """Classify a resolved next action: ``AUTO`` or ``APPROVAL_REQUIRED``.
+
+    Pure and deterministic. Precedence:
+
+    1. Explicit per-action operator override (``policy['approvals']``).
+    2. ``checkpoint`` mode → everything requires approval.
+    3. Canonical-branch context for branch-sensitive actions (commit/push/
+       delivery/push checkpoint on ``main``/protected branches).
+    4. Hard-coded approval table (merges, force pushes, destructive ops,
+       product/security direction, external impact, ambiguous decisions).
+    5. Hard-coded auto table (internal, reversible, non-destructive work).
+    6. Unknown actions fail closed to APPROVAL_REQUIRED.
+
+    Returns ``{"decisionClass", "requiresApproval", "rationale"}``.
+    """
+    policy = dict(DEFAULT_AUTONOMY_POLICY, **(policy or {}))
+    key = str(action_type or "").strip().upper() or None
+
+    # 1) Explicit operator override — highest precedence.
+    override = (policy.get("approvals") or {}).get(key) if key else None
+    if override == "required":
+        return {
+            "decisionClass": APPROVAL_REQUIRED,
+            "requiresApproval": True,
+            "rationale": f"Operator autonomy override: {key} requires approval.",
+        }
+    if override == "auto":
+        return {
+            "decisionClass": AUTO,
+            "requiresApproval": False,
+            "rationale": f"Operator autonomy override: {key} is auto-approved.",
+        }
+
+    # 2) Checkpoint mode: every transition is surfaced to the operator.
+    if (policy.get("mode") or AUTONOMY_MODE_AUTO) == AUTONOMY_MODE_CHECKPOINT:
+        return {
+            "decisionClass": APPROVAL_REQUIRED,
+            "requiresApproval": True,
+            "rationale": "Operator autonomy policy is checkpoint mode — "
+                         "approval requested at every gate/transition.",
+        }
+
+    if not key:
+        return {
+            "decisionClass": APPROVAL_REQUIRED,
+            "requiresApproval": True,
+            "rationale": "No resolvable action identity — cannot determine "
+                         "safety; approval required.",
+        }
+
+    # 3) Canonical-branch context (branch-sensitive identities).
+    canonical = _branch_is_canonical(branch, policy)
+    if key in _BRANCH_CONTEXT_ACTION_TYPES:
+        if canonical:
+            return {
+                "decisionClass": APPROVAL_REQUIRED,
+                "requiresApproval": True,
+                "rationale": f"{key} would mutate canonical branch state "
+                             f"({branch!r}); approval required.",
+            }
+        if branch:
+            return {
+                "decisionClass": AUTO,
+                "requiresApproval": False,
+                "rationale": f"{key} on feature branch {branch!r} — "
+                             "reversible, non-destructive, within approved scope.",
+            }
+        return {
+            "decisionClass": APPROVAL_REQUIRED,
+            "requiresApproval": True,
+            "rationale": f"{key} without confirmable repository identity — "
+                         "cannot verify it stays off canonical state.",
+        }
+
+    # 4) / 5) Hard tables.
+    if key in _APPROVAL_ACTION_TYPES:
+        return {
+            "decisionClass": APPROVAL_REQUIRED,
+            "requiresApproval": True,
+            "rationale": f"{key} crosses the operator-approval boundary "
+                         "(canonical mutation, destructive/irreversible step, "
+                         "or material decision).",
+        }
+    if key in _AUTO_ACTION_TYPES:
+        return {
+            "decisionClass": AUTO,
+            "requiresApproval": False,
+            "rationale": f"{key} is internal to the current mission, "
+                         "reversible, non-destructive, and within approved scope.",
+        }
+
+    # 6) Fail closed: unknown actions are never silently auto-executed.
+    return {
+        "decisionClass": APPROVAL_REQUIRED,
+        "requiresApproval": True,
+        "rationale": f"{key} is not covered by the autonomy policy and its "
+                     "safety cannot be determined confidently; approval required.",
+    }
+
+
 def resolve_next_action(
     snapshot: dict,
     *,
     approvals_policy: Optional[dict] = None,
+    autonomy_policy: Optional[dict] = None,
 ) -> dict:
     """Resolve the recommended next workflow from a synthesized snapshot.
 
     Pure + generic (no product-specific logic). Inputs are persisted facts:
     gate verdict, active workers, blockers, repo state. Output is a
-    structured recommendation::
+    structured decision::
 
         {"type": str, "requiresApproval": bool, "reason": str,
-         "sequence": [str, ...]}
+         "sequence": [str, ...],
+         "decisionClass": "AUTO"|"APPROVAL_REQUIRED", "rationale": str}
 
-    Nothing here performs an action — it only recommends, so authorization
-    boundaries are respected by construction. When any approval-gated step
-    (commit / push / merge) is recommended, ``requiresApproval`` is True and
-    the caller should surface "awaiting your approval".
+    ``decisionClass`` is explicit policy, never prose. ``approvals_policy``
+    is accepted for back-compat and merged as per-action ``approvals``
+    overrides (e.g. ``{"commit": "required"}``). ``autonomy_policy`` is the
+    persisted operator policy (see :func:`autonomy_policy_from_config`);
+    defaults to the built-in auto policy.
+
+    Nothing here performs an action — it only decides, so authorization
+    boundaries are respected by construction. When the decision class is
+    APPROVAL_REQUIRED the caller surfaces "awaiting your approval"; when
+    AUTO the caller executes/starts the resolved workflow without asking.
     """
-    policy = {
-        "commit": True,
-        "push": True,
-        "merge": True,
-        **(approvals_policy or {}),
-    }
+    policy = dict(DEFAULT_AUTONOMY_POLICY)
+    if autonomy_policy:
+        policy.update(autonomy_policy)
+    if approvals_policy:
+        # Legacy {verb: bool} shape: True -> required, False -> auto,
+        # expanded onto the resolver action identities the verb used to gate.
+        merged = dict(policy.get("approvals") or {})
+        required_aliases: set[str] = set()
+        auto_aliases: set[str] = set()
+        for key, value in approvals_policy.items():
+            aliases = _LEGACY_VERB_ALIASES.get(
+                str(key).strip().upper(), (str(key).strip().upper(),)
+            )
+            if value is True:
+                required_aliases.update(aliases)
+            elif value is False:
+                auto_aliases.update(aliases)
+        for alias in sorted(required_aliases):
+            merged[alias] = "required"
+        # Auto only wins when no other contributing verb forces approval.
+        for alias in sorted(auto_aliases):
+            if alias not in required_aliases:
+                merged[alias] = "auto"
+        policy["approvals"] = merged
+
     blockers = [b for b in (snapshot.get("blockers") or []) if b]
     active = [w for w in (snapshot.get("active_workers") or []) if w]
     repo = snapshot.get("repo_state") or {}
     verdict = snapshot.get("verdict")
+    branch = repo.get("branch")
 
     if blockers:
+        action_type = "AWAITING_DECISION"
         return {
-            "type": "AWAITING_DECISION",
+            "type": action_type,
             "requiresApproval": True,
             "reason": f"Unresolved blocker(s): {', '.join(blockers)} — human decision required.",
             "sequence": ["Resolve blockers", "Re-run the affected reviews", "Re-run the final gate"],
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
         }
     if active:
+        action_type = "AWAITING_WORKERS"
         return {
-            "type": "AWAITING_WORKERS",
+            "type": action_type,
             "requiresApproval": False,
             "reason": f"Active worker(s) still running: {', '.join(active)}.",
             "sequence": ["Wait for active workers", "Confirm gate verdict"],
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
         }
     if verdict is False:
+        action_type = "REMEDIATION"
         return {
-            "type": "REMEDIATION",
+            "type": action_type,
             "requiresApproval": False,
             "reason": "Final gate rejected — remediation required before any delivery.",
             "sequence": ["Route remediation to the implementer", "Security/DevOps re-review", "Independent QA re-review", "Re-run the final gate"],
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
         }
     if verdict is not True:
+        action_type = "AWAITING_DECISION"
         return {
-            "type": "AWAITING_DECISION",
+            "type": action_type,
             "requiresApproval": True,
             "reason": "Gate completed without an explicit ACCEPT verdict — confirm before proceeding.",
             "sequence": ["Inspect gate run summary", "Confirm accept/reject"],
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
         }
 
     # Accepted. Recommend the legitimate next workflow from repo state.
     dirty = bool(repo.get("dirty"))
     committed = bool(repo.get("committed"))
     pushed = bool(repo.get("pushed"))
-    branch = repo.get("branch") or "current branch"
 
     if dirty:
+        action_type = "DELIVERY_CHECKPOINT"
         return {
-            "type": "DELIVERY_CHECKPOINT",
-            "requiresApproval": policy.get("commit", True) or policy.get("push", True),
+            "type": action_type,
+            "requiresApproval": classify_next_action(
+                action_type, branch=branch, policy=policy
+            )["requiresApproval"],
             "reason": "Final gate accepted; candidate remains uncommitted.",
             "sequence": [
                 "Verify accepted manifest has not drifted",
@@ -4968,39 +5538,53 @@ def resolve_next_action(
                 "Push the feature branch",
                 "Do not merge without separate authorization",
             ],
-            "nextAction": "DELIVERY_CHECKPOINT",
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
         }
     if committed and not pushed:
+        action_type = "PUSH_CHECKPOINT"
         return {
-            "type": "PUSH_CHECKPOINT",
-            "requiresApproval": policy.get("push", True),
+            "type": action_type,
+            "requiresApproval": classify_next_action(
+                action_type, branch=branch, policy=policy
+            )["requiresApproval"],
             "reason": "Final gate accepted and committed; branch not yet pushed.",
             "sequence": [
                 "Push the current feature branch",
                 "Verify local == remote SHA",
                 "Do not merge without separate authorization",
             ],
-            "nextAction": "PUSH_CHECKPOINT",
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
         }
     if committed and pushed:
+        action_type = "INTEGRATION_REVIEW"
         return {
-            "type": "INTEGRATION_REVIEW",
-            "requiresApproval": policy.get("merge", True),
-            "reason": "Accepted and pushed — integration/review is next if policy permits.",
+            "type": action_type,
+            "requiresApproval": True,
+            "reason": "Accepted and pushed — integration/review is next; the merge "
+                      "decision itself requires operator approval.",
             "sequence": [
                 "Integration review",
                 "Merge decision (requires approval)",
                 "Close the mission",
             ],
-            "nextAction": "INTEGRATION_REVIEW",
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
         }
     # No repo facts (scratch workspace / not a git repo).
+    action_type = "CONFIRM_REPO_STATE"
     return {
-        "type": "CONFIRM_REPO_STATE",
+        "type": action_type,
         "requiresApproval": True,
         "reason": "Accepted mission with no repository facts — confirm delivery state before proposing a workflow.",
         "sequence": ["Confirm repository state", "Decide delivery or closure"],
-        "nextAction": "CONFIRM_REPO_STATE",
+        "nextAction": action_type,
+        "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+        "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
     }
 
 

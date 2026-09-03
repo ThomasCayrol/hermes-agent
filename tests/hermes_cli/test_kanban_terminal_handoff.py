@@ -22,6 +22,7 @@ Spec scenarios:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -241,3 +242,193 @@ def test_resolver_active_worker_waits():
         "blockers": [], "repo_state": {"dirty": True},
     })
     assert action["type"] == "AWAITING_WORKERS"
+
+
+# -- gate_verdict derivation (2026-09-03 false-REJECT regression) ----------
+#
+# Symptom: a gate whose run summary OPENS 'CDP FINAL GATE ACCEPT - ...' was
+# derived REJECTED because the old code substring-scanned the ENTIRE
+# concatenated (summary + result) text with reject markers checked first, so
+# reviewer history in the prose ('Security REJECT -> remediation') flipped the
+# verdict. Fix (CDP decision 2026-09-03): task.result parsed FIRST in
+# isolation; free-text fallback limited to the opening verdict window
+# (GATE_OPENING_WINDOW) with gate-scoped phrase priority.
+
+
+def _run_gate_mission(conn, *, result=None, summary=None) -> tuple[str, str]:
+    """Create + finish a canonical mission (umbrella -> done gate).
+
+    ``result`` defaults to None so tests can model the real regression case
+    (gate completed WITHOUT an explicit structured task.result).
+    """
+    umbrella = kb.create_task(conn, title="Mission", role="umbrella")
+    gate = kb.create_task(conn, title="Gate", role="gate", parents=[umbrella])
+    kb.claim_task(conn, umbrella)
+    kb.complete_task(conn, umbrella, result="mission underway")
+    assert kb.claim_task(conn, gate) is not None
+    ok = kb.complete_task(conn, gate, result=result, summary=summary)
+    assert ok
+    return umbrella, gate
+
+
+def test_gate_verdict_accept_survives_reviewer_history_in_summary(conn):
+    """Regression: 'Security REJECT' prose later in the summary must not flip
+    a gate whose summary opens with its own ACCEPT verdict line."""
+    umbrella, gate = _run_gate_mission(
+        conn,
+        result=None,
+        summary=(
+            "CDP FINAL GATE ACCEPT - AppStock regression stabilization accepted. "
+            "Evidence: Product register, UX audit, Lead implementation, "
+            "Security REJECT->remediation, DevOps PASS, QA ACCEPT verified."
+        ),
+    )
+    gate_task = kb.get_task(conn, gate)
+    assert gate_task is not None
+    assert kb.gate_verdict(conn, gate_task) is True
+
+
+def test_gate_verdict_structured_result_parsed_in_isolation(conn):
+    """result=ACCEPTED wins even when the summary mentions a REJECT history."""
+    umbrella, gate = _run_gate_mission(
+        conn,
+        result="ACCEPTED",
+        summary="Security REJECT -> remediation, then final acceptance; all checks green.",
+    )
+    gate_task = kb.get_task(conn, gate)
+    assert gate_task is not None
+    assert kb.gate_verdict(conn, gate_task) is True
+
+
+def test_gate_verdict_reject_result_wins_over_accept_prose(conn):
+    """result=REJECTED stays rejected regardless of accept prose in summary."""
+    umbrella, gate = _run_gate_mission(
+        conn,
+        result="REJECTED",
+        summary="QA ACCEPTED on first pass; blockers remain open.",
+    )
+    gate_task = kb.get_task(conn, gate)
+    assert gate_task is not None
+    assert kb.gate_verdict(conn, gate_task) is False
+
+
+def test_gate_verdict_gate_scoped_phrase_beats_earlier_plain_marker(conn):
+    """A gate's OWN phrase ('GATE ACCEPT') outranks an earlier plain REJECT
+    marker from reviewer prose inside the opening window."""
+    umbrella, gate = _run_gate_mission(
+        conn,
+        result=None,
+        summary="REJECT noted by QA; however CDP FINAL GATE ACCEPT - final.",
+    )
+    gate_task = kb.get_task(conn, gate)
+    assert gate_task is not None
+    assert kb.gate_verdict(conn, gate_task) is True
+
+
+def test_gate_verdict_marker_outside_opening_window_ignored(conn):
+    """Free-text fallback only reads the opening verdict statement; a REJECT
+    buried later in a neutral summary is not a verdict (fail toward human
+    check instead of a wrong derivation)."""
+    umbrella, gate = _run_gate_mission(
+        conn,
+        result=None,
+        summary=("Neutral narrative text " * 10)
+        + "FINAL VERDICT REJECTED - changes required.",
+    )
+    gate_task = kb.get_task(conn, gate)
+    assert gate_task is not None
+    assert kb.gate_verdict(conn, gate_task) is None
+
+
+def test_verdict_from_marker_text_boundaries():
+    """Helper boundaries: empty/None text is not a verdict; single-token
+    structured results resolve unambiguously."""
+    assert kb._verdict_from_marker_text(None) is None
+    assert kb._verdict_from_marker_text("") is None
+    assert kb._verdict_from_marker_text("ACCEPTED") is True
+    assert kb._verdict_from_marker_text("REJECTED") is False
+    assert kb._verdict_from_marker_text("NOT ACCEPTED") is False
+
+
+# -- recompute: corrective RECOMPUTED handoff -------------------------------
+
+
+def _handoff_comment_bodies(conn, task_id) -> list[str]:
+    return [
+        c.body for c in kb.list_comments(conn, task_id) if kb.HANDOFF_MARKER in c.body
+    ]
+
+
+def _newest_handoff_event_payload(conn, task_id) -> dict:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, kb.HANDOFF_EVENT_KIND),
+    ).fetchone()
+    assert row is not None and row["payload"]
+    return json.loads(row["payload"])
+
+
+def test_recompute_appends_corrective_handoff_when_verdict_changes(conn):
+    """Stored REJECTED handoff + structured result later corrected to ACCEPTED
+    -> recompute appends a RECOMPUTED handoff; the original stays for audit."""
+    umbrella, gate = _run_gate_mission(
+        conn,
+        result="REJECT",
+        summary="Gate rejected: blockers open.",
+    )
+    gate_task = kb.get_task(conn, gate)
+    assert gate_task is not None
+    assert kb.emit_terminal_handoff(conn, gate_task) is True
+    assert len(_handoff_comment_bodies(conn, umbrella)) == 1
+    assert _newest_handoff_event_payload(conn, umbrella)["verdict"].startswith("REJECT")
+
+    # The record is corrected: structured task.result now carries ACCEPTED.
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET result = ? WHERE id = ?", ("ACCEPTED", gate))
+
+    gate_task = kb.get_task(conn, gate)
+    assert gate_task is not None and gate_task.result == "ACCEPTED"
+    assert kb.emit_terminal_handoff(conn, gate_task, recompute=True) is True
+
+    bodies = _handoff_comment_bodies(conn, umbrella)
+    assert len(bodies) == 2  # original preserved + corrective appended
+    assert "RECOMPUTED" in bodies[1]
+    newest = _newest_handoff_event_payload(conn, umbrella)
+    assert newest["verdict"] == "ACCEPTED"
+    assert newest["recomputed"] is True
+
+    # Derivation now matches the stored verdict -> further recomputes no-op.
+    assert kb.emit_terminal_handoff(conn, gate_task, recompute=True) is False
+    assert len(_handoff_comment_bodies(conn, umbrella)) == 2
+
+
+def test_recompute_noop_when_verdict_unchanged(conn):
+    """Stored ACCEPTED + derived ACCEPTED -> recompute never re-emits."""
+    umbrella, gate = _run_gate_mission(
+        conn,
+        result="ACCEPTED",
+        summary="All green.",
+    )
+    gate_task = kb.get_task(conn, gate)
+    assert gate_task is not None
+    assert kb.emit_terminal_handoff(conn, gate_task) is True
+    assert kb.emit_terminal_handoff(conn, gate_task, recompute=True) is False
+    assert len(_handoff_comment_bodies(conn, umbrella)) == 1
+
+
+def test_recompute_without_prior_handoff_emits_normal(conn):
+    """recompute=True before any handoff exists behaves like a normal first
+    emission (no RECOMPUTED marking, no corrective event)."""
+    umbrella, gate = _run_gate_mission(
+        conn,
+        result="ACCEPTED",
+        summary="All green.",
+    )
+    gate_task = kb.get_task(conn, gate)
+    assert gate_task is not None
+    assert kb.emit_terminal_handoff(conn, gate_task, recompute=True) is True
+    bodies = _handoff_comment_bodies(conn, umbrella)
+    assert len(bodies) == 1
+    assert "RECOMPUTED" not in bodies[0]
+    assert _newest_handoff_event_payload(conn, umbrella)["recomputed"] is False
