@@ -4970,6 +4970,27 @@ def _last_handoff_verdict(conn: sqlite3.Connection, task_id: str) -> Optional[bo
     return None
 
 
+def _last_handoff_next_action_type(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Action type stored by the most recent terminal handoff event."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, HANDOFF_EVENT_KIND),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return None
+    payload = payload or {}
+    na = payload.get("next_action") or payload.get("decision") or {}
+    if isinstance(na, dict):
+        return na.get("type") or na.get("actionType")
+    return None
+
+
+
 def emit_terminal_handoff(
     conn: sqlite3.Connection,
     gate: Task,
@@ -5012,7 +5033,18 @@ def emit_terminal_handoff(
     if recompute and has_marker:
         derived = gate_verdict(conn, gate)
         stored = _last_handoff_verdict(conn, target_id)
-        if derived is None or stored == derived:
+        # Refresh the persisted decision when the resolved next action has
+        # moved even if the verdict itself is unchanged (repo state advanced,
+        # e.g. dirty -> committed -> pushed), so the newest handoff record
+        # always carries the current workflow stage.
+        probe_snapshot = synthesize_terminal_handoff(conn, gate, umbrella)
+        probe_next = resolve_next_action(
+            probe_snapshot, autonomy_policy=autonomy_policy,
+        )
+        stored_type = _last_handoff_next_action_type(conn, target_id)
+        if derived is None or (
+            stored == derived and stored_type == probe_next.get("type")
+        ):
             return False
     elif not recompute and has_marker:
         return False

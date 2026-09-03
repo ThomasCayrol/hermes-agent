@@ -432,3 +432,112 @@ def test_recompute_without_prior_handoff_emits_normal(conn):
     assert len(bodies) == 1
     assert "RECOMPUTED" not in bodies[0]
     assert _newest_handoff_event_payload(conn, umbrella)["recomputed"] is False
+
+
+# -- recompute: next-action TYPE refresh (2026-09-03 delivery sessions) ------
+#
+# The recompute path must refresh the persisted handoff when the RESOLVED
+# NEXT-ACTION TYPE moves even though the verdict itself is unchanged (repo
+# state advanced, e.g. dirty -> committed -> pushed). Before the fix the
+# guard compared only the verdict, so a stale handoff kept proposing
+# DELIVERY_CHECKPOINT after the work was already committed.
+
+
+def _next_action_type(payload: dict) -> str | None:
+    na = payload.get("next_action") or payload.get("decision") or {}
+    return na.get("type") or na.get("actionType")
+
+
+def _commit_all(repo) -> None:
+    import subprocess
+
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "advance"],
+        check=True,
+    )
+
+
+def test_recompute_refreshes_handoff_when_next_action_type_moves(conn, tmp_path):
+    """Stored DELIVERY_CHECKPOINT + repo advanced dirty -> committed yields a
+    RECOMPUTED handoff carrying PUSH_CHECKPOINT; further recomputes no-op."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    (repo / "a.txt").write_text("x")
+    subprocess.run(["git", "-C", str(repo), "add", "a.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"], check=True)
+    (repo / "b.txt").write_text("y")  # dirty at first emission
+
+    umbrella = kb.create_task(conn, title="Mission", role="umbrella")
+    gate = kb.create_task(
+        conn, title="Gate", role="gate", parents=[umbrella],
+        workspace_kind="dir", workspace_path=str(repo),
+    )
+    kb.claim_task(conn, umbrella)
+    kb.complete_task(conn, umbrella, result="mission underway")
+    assert kb.claim_task(conn, gate) is not None
+    assert kb.complete_task(conn, gate, result="ACCEPTED", summary="All green.")
+    gate_task = kb.get_task(conn, gate)
+    assert gate_task is not None
+
+    # First emission while the tree is dirty -> DELIVERY_CHECKPOINT stored.
+    assert kb.emit_terminal_handoff(conn, gate_task) is True
+    first = _newest_handoff_event_payload(conn, umbrella)
+    assert first["verdict"] == "ACCEPTED"
+    assert _next_action_type(first) == "DELIVERY_CHECKPOINT"
+
+    # Repo advances (dirty -> committed). Verdict unchanged, type must move.
+    _commit_all(repo)
+    assert kb.emit_terminal_handoff(conn, gate_task, recompute=True) is True
+
+    bodies = _handoff_comment_bodies(conn, umbrella)
+    assert len(bodies) == 2  # original preserved + type-refresh appended
+    assert "RECOMPUTED" in bodies[1]
+    newest = _newest_handoff_event_payload(conn, umbrella)
+    assert newest["verdict"] == "ACCEPTED"
+    assert _next_action_type(newest) == "PUSH_CHECKPOINT"
+    assert newest["recomputed"] is True
+
+    # Stored type now matches the derived type -> further recomputes no-op.
+    assert kb.emit_terminal_handoff(conn, gate_task, recompute=True) is False
+    assert len(_handoff_comment_bodies(conn, umbrella)) == 2
+
+
+def test_recompute_type_refresh_keeps_verdict_when_type_unchanged(conn, tmp_path):
+    """A repo-advance with no type move must never fabricate a corrective
+    handoff: verdict ACCEPTED + already-clean committed state stays PUSH
+    (single emission, recompute no-op)."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    (repo / "a.txt").write_text("x")
+    _commit_all(repo)  # clean committed (unpushed) from the start
+
+    umbrella = kb.create_task(conn, title="Mission", role="umbrella")
+    gate = kb.create_task(
+        conn, title="Gate", role="gate", parents=[umbrella],
+        workspace_kind="dir", workspace_path=str(repo),
+    )
+    kb.claim_task(conn, umbrella)
+    kb.complete_task(conn, umbrella, result="mission underway")
+    assert kb.claim_task(conn, gate) is not None
+    assert kb.complete_task(conn, gate, result="ACCEPTED", summary="All green.")
+    gate_task = kb.get_task(conn, gate)
+    assert gate_task is not None
+
+    assert kb.emit_terminal_handoff(conn, gate_task) is True
+    assert _next_action_type(_newest_handoff_event_payload(conn, umbrella)) == (
+        "PUSH_CHECKPOINT"
+    )
+    # No state moved (still clean + committed + unpushed): recompute no-ops.
+    assert kb.emit_terminal_handoff(conn, gate_task, recompute=True) is False
+    assert len(_handoff_comment_bodies(conn, umbrella)) == 1
