@@ -1578,10 +1578,18 @@ class GatewayKanbanWatchersMixin:
                 # for completed role=gate cards and emit their lifecycle
                 # handoff exactly once (idempotent). A final gate ACCEPTED
                 # must transition to an explicit terminal handoff + next-action
-                # proposal, never to a silent stop. Best-effort — a handoff
-                # failure must not break dispatch.
+                # proposal, never to a silent stop. The persisted operator
+                # autonomy policy (kanban.autonomy in config.yaml) is applied
+                # so the handoff records the correct decision class; absent
+                # config the built-in auto policy applies. Best-effort — a
+                # handoff failure must not break dispatch.
                 try:
-                    emitted = _kb.emit_terminal_handoffs_if_due(conn, board=slug)
+                    _autonomy_policy = _kb.autonomy_policy_from_config(
+                        {"kanban": kanban_cfg}
+                    )
+                    emitted = _kb.emit_terminal_handoffs_if_due(
+                        conn, board=slug, autonomy_policy=_autonomy_policy,
+                    )
                     if emitted:
                         logger.info(
                             "kanban dispatcher: emitted terminal handoff for gate card(s) %s on board %s",

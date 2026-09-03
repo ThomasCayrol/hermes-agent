@@ -2737,6 +2737,15 @@ def _cmd_archive(args: argparse.Namespace) -> int:
 
 def _cmd_handoff(args: argparse.Namespace) -> int:
     """Emit terminal mission handoffs for completed gate cards (idempotent)."""
+    # Persisted operator autonomy policy (config.yaml kanban.autonomy). Falls
+    # back to the built-in auto policy when config is unavailable.
+    autonomy_policy = None
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        autonomy_policy = kb.autonomy_policy_from_config(cfg)
+    except Exception:
+        autonomy_policy = None
     emitted: list[str] = []
     with kb.connect_closing() as conn:
         if args.task_id:
@@ -2752,11 +2761,15 @@ def _cmd_handoff(args: argparse.Namespace) -> int:
                 )
                 return 1
             if kb.emit_terminal_handoff(
-                conn, task, recompute=bool(getattr(args, "recompute", False))
+                conn, task,
+                recompute=bool(getattr(args, "recompute", False)),
+                autonomy_policy=autonomy_policy,
             ):
                 emitted.append(args.task_id)
         else:
-            emitted = kb.emit_terminal_handoffs_if_due(conn)
+            emitted = kb.emit_terminal_handoffs_if_due(
+                conn, autonomy_policy=autonomy_policy,
+            )
     if getattr(args, "json", False):
         print(json.dumps({"emitted": emitted}))
     elif emitted:
