@@ -56,6 +56,30 @@ export interface Diagnostic {
   count: number
   last_seen_at: number
   data: Record<string, unknown>
+  /** Operator-attention axis (additive over severity) — decided by the
+   *  engine, never re-derived by a surface. */
+  attention?: 'NONE' | 'INFO' | 'WARNING' | 'ACTION_REQUIRED' | 'CRITICAL' | null | string
+  owner_action?: 'NONE' | 'REQUIRED' | null | string
+  system_action?: null | string
+  attention_banner?: boolean
+  auto_recovery_state?: 'none' | 'in_progress' | 'succeeded' | 'failed' | null | string
+  classification?: null | string
+  /** French operator copy — STATUS / CAUSE / IMPACT (RISK for concurrency
+   *  kinds) / OWNER ACTION / SYSTEM ACTION content. */
+  operator_status?: null | string
+  operator_cause?: null | string
+  operator_impact?: null | string
+  operator_risk?: null | string
+}
+
+/** Sorted operator-attention levels (mirrors ATTENTION_ORDER in
+ *  hermes_cli/kanban_diagnostics.py). */
+export const ATTENTION_ORDER: string[] = ['NONE', 'INFO', 'WARNING', 'ACTION_REQUIRED', 'CRITICAL']
+
+/** GET /diagnostics — fleet-wide active diagnostics (engine truth). */
+export interface KanbanDiagnosticsResult {
+  diagnostics: Array<{ task_id: string; diagnostics: Diagnostic[] }>
+  count: number
 }
 
 export interface KanbanRun {

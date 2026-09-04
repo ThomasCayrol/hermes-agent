@@ -755,7 +755,7 @@ export const en: Translations = {
     hide: "Hide",
     show: "Show",
     attention: "Attention",
-    tasksNeedAttention: "tasks need attention",
+    tasksNeedAttention: "{n} tasks need attention",
     taskNeedsAttention: "1 task needs attention",
     diagnostic: "diagnostic",
     open: "Open",
