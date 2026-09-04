@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
+import pytest
 
 from gateway.config import Platform
 from gateway.kanban_watchers import (
@@ -79,6 +80,47 @@ def _unseen_terminal_events(tid):
         return events
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    "event_kind", ["crashed", "stale", kb.RECOVERY_EVENT_KIND]
+)
+def test_auto_recovery_events_deliver_persisted_french_status(
+    tmp_path, monkeypatch, event_kind,
+):
+    db_path = tmp_path / f"{event_kind}.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    message = (
+        "RÉCUPÉRATION AUTO — étape relancée automatiquement; "
+        "aucune action opérateur requise."
+    )
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="recovery", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="chat-1",
+        )
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                task_id,
+                event_kind,
+                {"operatorMessage": message, "decisionClass": kb.AUTO},
+            )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert message in adapter.sent[0]["text"]
+    assert "READY-TO-SEND PROMPT" not in adapter.sent[0]["text"]
 
 
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):

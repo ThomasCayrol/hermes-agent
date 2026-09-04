@@ -3947,6 +3947,455 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return removed
 
 
+def _reconciliation_refusal(reason: str) -> dict:
+    return {
+        "classification": STATE_INCONSISTENCY,
+        "decisionClass": APPROVAL_REQUIRED,
+        "requiresApproval": True,
+        "actionStatus": ACTION_STATUS_AWAITING_APPROVAL,
+        "ownerAction": "REQUIRED",
+        "requiredAction": "CONFIRM_PERSISTED_STATE",
+        "why": reason,
+        "reason": reason,
+        "unlinked": [],
+        "archived": [],
+        "rerunGate": None,
+    }
+
+
+def reconcile_proven_superseded_dependencies(
+    conn: sqlite3.Connection,
+    *,
+    proof: dict,
+    superseded_task_ids: Iterable[str],
+    rerun_gate_id: str,
+    max_actions: int = 8,
+) -> dict:
+    """Public AUTO mutation boundary; see the inner helper for semantics.
+
+    The whole validate-and-mutate sequence runs under a single IMMEDIATE
+    write transaction, so a concurrent writer cannot interleave between
+    validation reads and the deletes/archives/rerun below.  The inner
+    helper must therefore never open its own transaction.
+    """
+    return _reconcile_proven_superseded_dependencies_unlocked(
+        conn,
+        proof=proof,
+        superseded_task_ids=superseded_task_ids,
+        rerun_gate_id=rerun_gate_id,
+        max_actions=max_actions,
+    )
+
+
+def _reconcile_proven_superseded_dependencies_unlocked(
+    conn: sqlite3.Connection,
+    *,
+    proof: dict,
+    superseded_task_ids: Iterable[str],
+    rerun_gate_id: str,
+    max_actions: int = 8,
+) -> dict:
+    """Acquire the IMMEDIATE write transaction, then validate and mutate."""
+    with write_txn(conn):
+        validated, is_replay = _reconcile_proven_superseded_dependencies_locked(
+            conn,
+            proof=proof,
+            superseded_task_ids=superseded_task_ids,
+            rerun_gate_id=rerun_gate_id,
+            max_actions=max_actions,
+        )
+        if is_replay or validated["decisionClass"] != AUTO:
+            return validated
+        edges = validated["_edges"]
+        superseded = validated["_superseded"]
+        fingerprint = validated["_fingerprint"]
+        result = {
+            key: value
+            for key, value in validated.items()
+            if not key.startswith("_")
+        }
+        _apply_mutations(
+            conn,
+            edges,
+            superseded,
+            rerun_gate_id,
+            result,
+            fingerprint,
+        )
+    return _recompute_and_read_back(
+        conn,
+        edges,
+        superseded,
+        rerun_gate_id,
+        result,
+    )
+
+
+def _reconcile_proven_superseded_dependencies_locked(
+    conn: sqlite3.Connection,
+    *,
+    proof: dict,
+    superseded_task_ids: Iterable[str],
+    rerun_gate_id: str,
+    max_actions: int = 8,
+) -> tuple[dict, bool]:
+    """Validate a bounded reconciliation plan against persisted state.
+
+    Runs under the caller's single IMMEDIATE write transaction.  The return
+    is ``(result, replay)``; ``replay=True`` when the exact fingerprint was
+    already applied and the persisted state still matches it, so the caller
+    must not repeat the mutation.
+
+    This is the mutation boundary for the redacted-output regression class.
+    Raw command output and ``***`` placeholders are never predicates.  Every
+    edge must instead carry a direct checkout predicate with explicit
+    ``observed``, ``invalid`` and ``superseded`` booleans.  Validation is
+    completed by the caller under one IMMEDIATE write transaction, so a
+    concurrent writer cannot interleave between validation and mutation;
+    ambiguity returns ``STATE_INCONSISTENCY / APPROVAL_REQUIRED`` without
+    writing anything.
+
+    The AUTO path only deletes the proven reversible edges, archives the
+    explicitly superseded cards (without deleting their workspace, runs,
+    comments or events), reopens the existing final gate for a fresh run, and
+    then recomputes dependents.  A content-derived idempotency fingerprint
+    makes restart/replay return the original result without repeating writes.
+    """
+    if not isinstance(proof, dict):
+        return _reconciliation_refusal("Direct predicate proof is required."), False
+    checks = proof.get("checks")
+    if (
+        proof.get("kind") != "direct_predicates"
+        or proof.get("source") != "checkout_predicate"
+        or proof.get("redacted_output_used") is not False
+        or not isinstance(checks, list)
+        or not checks
+    ):
+        return (
+            _reconciliation_refusal(
+                "Proof is missing, redacted, or not sourced from direct checkout predicates."
+            ),
+            False,
+        )
+
+    normalized_checks: list[dict] = []
+    for check in checks:
+        if not isinstance(check, dict):
+            return (
+                _reconciliation_refusal(
+                    "Every edge proof must be a structured predicate."
+                ),
+                False,
+            )
+        parent_id = str(check.get("parent_id") or "")
+        child_id = str(check.get("child_id") or "")
+        predicate = str(check.get("predicate") or "")
+        if (
+            not parent_id
+            or not child_id
+            or not predicate
+            or "***" in predicate
+            or check.get("observed") is not True
+            or check.get("invalid") is not True
+            or check.get("superseded") is not True
+        ):
+            return (
+                _reconciliation_refusal(
+                    "An edge is not directly and unambiguously proven invalid/superseded."
+                ),
+                False,
+            )
+        normalized_checks.append({
+            "parent_id": parent_id,
+            "child_id": child_id,
+            "predicate": predicate,
+        })
+
+    if isinstance(superseded_task_ids, (str, bytes)):
+        return (
+            _reconciliation_refusal(
+                "Superseded card ids must be a bounded collection."
+            ),
+            False,
+        )
+    superseded = sorted(set(str(t) for t in superseded_task_ids if t))
+    edges = sorted(
+        (c["parent_id"], c["child_id"], c["predicate"])
+        for c in normalized_checks
+    )
+    edge_pairs = [(parent_id, child_id) for parent_id, child_id, _predicate in edges]
+    if len(edge_pairs) != len(set(edge_pairs)):
+        return (
+            _reconciliation_refusal(
+                "Each dependency edge must have exactly one direct predicate."
+            ),
+            False,
+        )
+    action_count = len(edges) + len(superseded) + 1
+    if not isinstance(max_actions, int) or isinstance(max_actions, bool) or max_actions < 1:
+        return (
+            _reconciliation_refusal(
+                "Recovery action limit must be a positive integer."
+            ),
+            False,
+        )
+    if action_count > min(max_actions, 32):
+        return (
+            _reconciliation_refusal(
+                f"Recovery plan has {action_count} actions; bounded limit is {max_actions}."
+            ),
+            False,
+        )
+    proven_parents = {parent_id for parent_id, _child_id, _predicate in edges}
+    if (
+        not superseded
+        or rerun_gate_id in superseded
+        or set(superseded) != proven_parents
+    ):
+        return (
+            _reconciliation_refusal(
+                "Every card selected for archive must be a directly proven superseded parent."
+            ),
+            False,
+        )
+
+    fingerprint_input = json.dumps(
+        {
+            "edges": edges,
+            "superseded": superseded,
+            "rerun_gate_id": rerun_gate_id,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    fingerprint = hashlib.sha256(fingerprint_input.encode("utf-8")).hexdigest()
+    prior = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC",
+        (rerun_gate_id, RECOVERY_EVENT_KIND),
+    ).fetchall()
+    for row in prior:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("fingerprint") == fingerprint:
+            prior_result = payload.get("result")
+            if isinstance(prior_result, dict):
+                edges_still_removed = all(
+                    not conn.execute(
+                        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                        (parent_id, child_id),
+                    ).fetchone()
+                    for parent_id, child_id, _predicate in edges
+                )
+                archived_state_preserved = all(
+                    (task := get_task(conn, task_id)) is not None
+                    and task.status == "archived"
+                    for task_id in superseded
+                )
+                if edges_still_removed and archived_state_preserved:
+                    return prior_result, True
+                return (
+                    _reconciliation_refusal(
+                        "Persisted recovery state drifted after the original reconciliation."
+                    ),
+                    False,
+                )
+
+    gate = get_task(conn, rerun_gate_id)
+    if gate is None or gate.role != "gate" or gate.status != "done" or gate.current_run_id is not None:
+        return (
+            _reconciliation_refusal(
+                "The requested existing final gate is not a completed, idle gate card."
+            ),
+            False,
+        )
+    for parent_id, child_id, _predicate in edges:
+        if not conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, child_id),
+        ).fetchone():
+            return (
+                _reconciliation_refusal(
+                    f"Proven edge {parent_id}->{child_id} no longer matches persisted state."
+                ),
+                False,
+            )
+    for task_id in superseded:
+        task = get_task(conn, task_id)
+        if (
+            task is None
+            or task.status in {"running", "archived"}
+            or task.role in {"umbrella", "gate"}
+        ):
+            return (
+                _reconciliation_refusal(
+                    f"Superseded card {task_id} is missing or not safe to archive automatically."
+                ),
+                False,
+            )
+        persisted_children = {
+            row["child_id"]
+            for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ?",
+                (task_id,),
+            ).fetchall()
+        }
+        proven_children = {
+            child_id
+            for parent_id, child_id, _predicate in edges
+            if parent_id == task_id
+        }
+        if persisted_children != proven_children:
+            return (
+                _reconciliation_refusal(
+                    f"Superseded card {task_id} has an unproven or stale dependency edge."
+                ),
+                False,
+            )
+
+    result = {
+        "classification": INVALID_SUPERSEDED_DEPENDENCY,
+        "decisionClass": AUTO,
+        "requiresApproval": False,
+        "actionStatus": ACTION_STATUS_RECOVERING,
+        "ownerAction": "NONE",
+        "reason": "Direct predicates proved the dependency edges invalid and the cards superseded.",
+        "unlinked": [[parent_id, child_id] for parent_id, child_id, _predicate in edges],
+        "archived": superseded,
+        "rerunGate": rerun_gate_id,
+        "nextAction": "RE_RUN_FINAL_GATE",
+    }
+    result["_edges"] = edges
+    result["_superseded"] = superseded
+    result["_fingerprint"] = fingerprint
+    return result, False
+
+
+def _apply_mutations(
+    conn: sqlite3.Connection,
+    edges: list[tuple[str, str, str]],
+    superseded: list[str],
+    rerun_gate_id: str,
+    result: dict,
+    fingerprint: str,
+) -> None:
+    """Persist the reconciliation writes inside the caller's transaction."""
+    now = int(time.time())
+    for parent_id, child_id, predicate in edges:
+        cur = conn.execute(
+            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, child_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"dependency edge changed during reconciliation: {parent_id}->{child_id}"
+            )
+        _append_event(
+            conn,
+            child_id,
+            "unlinked",
+            {
+                "parent": parent_id,
+                "child": child_id,
+                "reason": "proven_invalid_superseded",
+                "predicate": predicate,
+                "decisionClass": AUTO,
+            },
+        )
+    for task_id in superseded:
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'archived', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status NOT IN ('running', 'archived')",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"superseded card changed during reconciliation: {task_id}"
+            )
+        _append_event(
+            conn,
+            task_id,
+            "archived",
+            {
+                "reason": "superseded_recovery",
+                "historyPreserved": True,
+                "workspacePreserved": True,
+                "decisionClass": AUTO,
+            },
+        )
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'ready', completed_at = NULL, result = NULL, "
+        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+        "last_heartbeat_at = NULL "
+        "WHERE id = ? AND status = 'done' AND current_run_id IS NULL",
+        (rerun_gate_id,),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError("final gate changed during reconciliation")
+    _append_event(
+        conn,
+        rerun_gate_id,
+        "recovery_rerun_scheduled",
+        {
+            "nextAction": "RE_RUN_FINAL_GATE",
+            "decisionClass": AUTO,
+            "actionStatus": ACTION_STATUS_STARTING,
+            "ownerAction": "NONE",
+        },
+    )
+    _append_event(
+        conn,
+        rerun_gate_id,
+        RECOVERY_EVENT_KIND,
+        {
+            "fingerprint": fingerprint,
+            "healthClassification": INVALID_SUPERSEDED_DEPENDENCY,
+            "decisionClass": AUTO,
+            "actionStatus": ACTION_STATUS_RECOVERING,
+            "ownerAction": "NONE",
+            "lastActivity": now,
+            "nextAction": "RE_RUN_FINAL_GATE",
+            "operatorMessage": (
+                "RÉCUPÉRATION AUTO — dépendances invalides retirées, cartes "
+                "superseded archivées avec historique préservé et final gate "
+                "replanifié; aucune action opérateur requise."
+            ),
+            "result": result,
+        },
+    )
+
+    return None
+
+
+def _recompute_and_read_back(
+    conn: sqlite3.Connection,
+    edges: list[tuple[str, str, str]],
+    superseded: list[str],
+    rerun_gate_id: str,
+    result: dict,
+) -> dict:
+    """Recompute dependents after commit, then read every target back."""
+    recompute_ready(conn)
+    # Mandatory read-back: a successful write is not a successful recovery
+    # until every exact target reflects the planned state.
+    if any(
+        parent_ids(conn, child_id).count(parent_id)
+        for parent_id, child_id, _ in edges
+    ):
+        raise RuntimeError("dependency reconciliation read-back failed")
+    archived_tasks = [get_task(conn, task_id) for task_id in superseded]
+    if any(task is None or task.status != "archived" for task in archived_tasks):
+        raise RuntimeError("archive reconciliation read-back failed")
+    refreshed_gate = get_task(conn, rerun_gate_id)
+    if refreshed_gate is None or refreshed_gate.status != "ready":
+        raise RuntimeError("final gate rerun read-back failed")
+    return result
+
+
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
@@ -4869,7 +5318,11 @@ def repo_state_for(task: Optional[Task]) -> dict:
     ``branch``/``head`` when the workspace is a git repo. Any failure returns
     ``{}`` so the caller can degrade to an approval-required recommendation.
     """
-    if task is None or task.workspace_kind != "dir" or not task.workspace_path:
+    if (
+        task is None
+        or task.workspace_kind not in {"dir", "worktree"}
+        or not task.workspace_path
+    ):
         return {}
     ws = Path(task.workspace_path)
     if not ws.is_dir():
@@ -4889,10 +5342,15 @@ def repo_state_for(task: Optional[Task]) -> dict:
         dirty = bool(_git("status", "--porcelain"))
         # Count unpushed commits without rev-list @{u} syntax edge cases.
         ahead = _git("rev-list", "--count", "HEAD", "--not", "--remotes")
+        last_commit = _git("log", "-1", "--format=%ct")
         try:
             ahead_n = int(ahead) if ahead else 0
         except ValueError:
             ahead_n = 0
+        try:
+            last_commit_at = int(last_commit) if last_commit else None
+        except ValueError:
+            last_commit_at = None
         return {
             "branch": branch or None,
             "head": head or None,
@@ -4900,6 +5358,7 @@ def repo_state_for(task: Optional[Task]) -> dict:
             "committed": bool(head),
             "pushed": ahead_n == 0 and bool(head),
             "unpushed_commits": ahead_n,
+            "last_commit_at": last_commit_at,
         }
     except Exception:
         return {}
@@ -4913,9 +5372,11 @@ def synthesize_terminal_handoff(
     repo = repo_state_for(gate) or repo_state_for(umbrella)
     # Active workers: any running task whose parent chain includes umbrella.
     active: list[str] = []
+    running_evidence: list[dict] = []
     if umbrella is not None:
         rows = conn.execute(
-            "SELECT id, assignee, status FROM tasks WHERE status = 'running'"
+            "SELECT id, title, assignee, status, worker_pid, current_run_id, "
+            "last_heartbeat_at FROM tasks WHERE status = 'running'"
         ).fetchall()
         for row in rows:
             if row["id"] == umbrella.id:
@@ -4926,6 +5387,41 @@ def synthesize_terminal_handoff(
             ).fetchone()
             if linked:
                 active.append(f"{row['id']} ({row['assignee'] or 'unassigned'})")
+                heartbeat = (
+                    int(row["last_heartbeat_at"])
+                    if row["last_heartbeat_at"] is not None
+                    else None
+                )
+                activity = conn.execute(
+                    "SELECT created_at FROM task_events WHERE task_id = ? "
+                    "AND kind IN ('activity', 'progress', 'tool_progress') "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                activity_at = (
+                    int(activity["created_at"])
+                    if activity is not None
+                    else None
+                )
+                last_activity = max(
+                    value for value in (heartbeat, activity_at) if value is not None
+                ) if heartbeat is not None or activity_at is not None else None
+                worker_pid = int(row["worker_pid"]) if row["worker_pid"] else None
+                worker_alive = _pid_alive(worker_pid) if worker_pid else None
+                if row["current_run_id"] is not None and (
+                    worker_alive is True
+                    or (
+                        heartbeat is not None
+                        and int(time.time()) - heartbeat < _STALE_HEARTBEAT_GAP_SECONDS
+                    )
+                ):
+                    running_evidence.append({
+                        "workerPid": worker_pid,
+                        "runId": int(row["current_run_id"]),
+                        "lastHeartbeat": heartbeat,
+                        "lastActivity": last_activity,
+                        "currentTask": row["id"],
+                    })
     blockers: list[str] = []
     if umbrella is not None:
         for row in conn.execute(
@@ -4944,6 +5440,7 @@ def synthesize_terminal_handoff(
         "gate_status": gate.status,
         "verdict": verdict,
         "active_workers": active,
+        "running_evidence": running_evidence,
         "blockers": blockers,
         "repo_state": repo,
     }
@@ -5056,10 +5553,14 @@ def emit_terminal_handoff(
         True: "ACCEPTED", False: "REJECTED / CHANGES REQUIRED", None: "NO EXPLICIT VERDICT",
     }.get(snapshot["verdict"], "NO EXPLICIT VERDICT")
     decision_class = next_action.get("decisionClass") or APPROVAL_REQUIRED
+    running_evidence = snapshot.get("running_evidence") or []
+    owner_action = "REQUIRED" if decision_class == APPROVAL_REQUIRED else "NONE"
     action_status = (
-        ACTION_STATUS_STARTING
-        if decision_class == AUTO
-        else ACTION_STATUS_AWAITING_APPROVAL
+        ACTION_STATUS_AWAITING_APPROVAL
+        if decision_class == APPROVAL_REQUIRED
+        else ACTION_STATUS_RUNNING
+        if running_evidence
+        else ACTION_STATUS_STARTING
     )
     repo_txt = ""
     if snapshot["repo_state"]:
@@ -5080,7 +5581,7 @@ def emit_terminal_handoff(
         f"Active workers: {workers_txt}; unresolved blockers: {blockers_txt}."
     )
     decision_txt = (
-        f"{decision_class} — Hermes continues automatically."
+        f"{decision_class} — action autorisée; exécution non déduite de nextAction."
         if decision_class == AUTO
         else f"{decision_class} — awaiting operator approval."
     )
@@ -5090,19 +5591,31 @@ def emit_terminal_handoff(
         else "\nApproval required: no (low-risk, in-scope action)."
     )
     seq_txt = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(next_action.get("sequence", [])))
+    running_txt = "\n".join(
+        "  worker={workerPid} run={runId} lastHeartbeat={lastHeartbeat} "
+        "lastActivity={lastActivity} currentTask={currentTask}".format(**item)
+        for item in running_evidence
+    )
     marker_line = HANDOFF_MARKER
     if recompute and has_marker:
         marker_line = (
             f"{HANDOFF_MARKER} (RECOMPUTED — structured verdict supersedes "
             "the prior derivation)"
         )
-    closing_txt = (
-        f"Next step: {next_action.get('type', 'NONE')} — started automatically; "
-        "no approval needed."
-        if decision_class == AUTO
-        else f"Next step: {next_action.get('type', 'NONE')}. Awaiting your approval."
-    )
-    body = (
+    if decision_class == APPROVAL_REQUIRED:
+        closing_txt = (
+            f"Next step: {next_action.get('type', 'NONE')}. Awaiting your approval."
+        )
+    elif action_status == ACTION_STATUS_RUNNING:
+        closing_txt = (
+            f"Next step: {next_action.get('type', 'NONE')} — live execution observed."
+        )
+    else:
+        closing_txt = (
+            f"Next step: {next_action.get('type', 'NONE')} — planned; "
+            "execution not yet observed."
+        )
+    common_body = (
         f"{marker_line}\n"
         f"Mission: {snapshot['mission']}\n"
         f"Final gate {snapshot['gate_id']}: {verdict_txt}\n"
@@ -5113,10 +5626,56 @@ def emit_terminal_handoff(
         f"{next_action.get('reason', '')}\n"
         f"Decision class: {decision_txt}\n"
         f"Rationale: {next_action.get('rationale', '')}{approval_txt}\n"
-        f"Action status: {action_status}\n"
         f"Sequence:\n{seq_txt}\n"
-        f"{closing_txt}"
     )
+    if decision_class == AUTO:
+        if action_status == ACTION_STATUS_RUNNING:
+            body = (
+                f"{common_body}"
+                "ACTIF\n"
+                "Hermes exécute la mission avec un worker/run observé.\n"
+                "OWNER ACTION: NONE\n"
+                f"ACTION STATUS: {ACTION_STATUS_RUNNING}\n"
+                "RUNNING EVIDENCE\n"
+                f"{running_txt}\n"
+                f"{closing_txt}"
+            )
+        else:
+            body = (
+                f"{common_body}"
+                "ACTION AUTO PLANIFIÉE\n"
+                "OWNER ACTION: NONE\n"
+                f"ACTION STATUS: {ACTION_STATUS_STARTING}\n"
+                "L’action est matérialisée mais son exécution n’est pas encore "
+                "observée; aucune action opérateur requise.\n"
+                f"{closing_txt}"
+            )
+    else:
+        body = (
+            f"{common_body}"
+            "MISSION ARRÊTÉE\n"
+            "Cause\n"
+            f"{next_action.get('reason', '') or 'Non disponible'}\n"
+            "Étape bloquée\n"
+            f"Final gate {snapshot['gate_id']}\n"
+            "Pourquoi Hermes ne peut pas continuer seul\n"
+            f"{next_action.get('rationale', '') or 'Confirmation Hermes requise'}\n"
+            "Solution recommandée\n"
+            f"Confirmer dans Hermes la prochaine action {next_action.get('type', 'NONE')}.\n"
+            "Impact si aucune action\n"
+            "La mission reste arrêtée à cette étape.\n"
+            "RECOMMENDED OWNER DECISION\n"
+            "OWNER ACTION: REQUIRED\n"
+            f"REQUIRED ACTION: Confirmer ou refuser {next_action.get('type', 'NONE')} "
+            "dans Hermes.\n"
+            f"WHY: {next_action.get('rationale', '') or 'Confirmation Hermes requise'}\n"
+            "READY-TO-SEND PROMPT\n"
+            "Non disponible — transmettre la décision directement dans Hermes.\n"
+            f"DECISION CLASS: {APPROVAL_REQUIRED}\n"
+            f"ACTION STATUS: {ACTION_STATUS_AWAITING_APPROVAL}\n"
+            "L’approbation et l’exécution passent par Hermes.\n"
+            f"{closing_txt}"
+        )
     with write_txn(conn):
         add_comment(conn, target_id, HANDOFF_AUTHOR, body)
         _append_event(
@@ -5138,11 +5697,27 @@ def emit_terminal_handoff(
                     "requiresApproval": bool(next_action.get("requiresApproval")),
                     "rationale": next_action.get("rationale"),
                     "actionStatus": action_status,
+                    "ownerAction": owner_action,
+                    "requiredAction": (
+                        f"Confirmer ou refuser {next_action.get('type', 'NONE')} dans Hermes."
+                        if owner_action == "REQUIRED"
+                        else None
+                    ),
+                    "why": next_action.get("rationale"),
+                    "runningEvidence": running_evidence,
                     "analysis": analysis,
                     "autonomyMode": (autonomy_policy or DEFAULT_AUTONOMY_POLICY).get("mode"),
                 },
                 "autoContinue": decision_class == AUTO,
                 "recomputed": bool(recompute and has_marker),
+                "healthClassification": (
+                    ACTIVE if has_marker else COMPLETED_UNHANDED
+                ),
+                "lastActivity": int(time.time()),
+                "nextAction": next_action.get("type"),
+                "ownerAction": owner_action,
+                "actionStatus": action_status,
+                "runningEvidence": running_evidence,
             },
         )
         if decision_class == AUTO:
@@ -5202,11 +5777,30 @@ def emit_terminal_handoffs_if_due(
 AUTO = "AUTO"
 APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
 
+# Persisted task-health taxonomy.  These are deliberately separate from the
+# board's workflow statuses: a ``running`` row can be ACTIVE, STALLED, or
+# ORPHANED depending on corroborating run/process/activity evidence.
+ACTIVE = "ACTIVE"
+STALLED = "STALLED"
+ORPHANED = "ORPHANED"
+FAILED = "FAILED"
+COMPLETED_UNHANDED = "COMPLETED_UNHANDED"
+DEPENDENCY_DEADLOCK = "DEPENDENCY_DEADLOCK"
+INVALID_SUPERSEDED_DEPENDENCY = "INVALID_SUPERSEDED_DEPENDENCY"
+APPROVAL_BLOCKED = "APPROVAL_BLOCKED"
+STATE_INCONSISTENCY = "STATE_INCONSISTENCY"
+
 ACTION_STATUS_STARTING = "STARTING"
 ACTION_STATUS_EXECUTED = "EXECUTED"
+ACTION_STATUS_RUNNING = "RUNNING"
+ACTION_STATUS_RECOVERING = "RECOVERING"
 ACTION_STATUS_AWAITING_APPROVAL = "AWAITING_APPROVAL"
+ACTION_STATUS_BLOCKED = "BLOCKED"
+ACTION_STATUS_COMPLETED = "COMPLETED"
+ACTION_STATUS_FAILED = "FAILED"
 
 AUTO_CONTINUE_EVENT_KIND = "auto_continue"
+RECOVERY_EVENT_KIND = "auto_recovery"
 
 AUTONOMY_MODE_AUTO = "auto"
 AUTONOMY_MODE_CHECKPOINT = "checkpoint"
@@ -5240,6 +5834,7 @@ _AUTO_ACTION_TYPES = frozenset({
     "BRANCH_COMMIT",
     "DOCUMENTATION",
     "WORKER_RETRY",
+    "RECOMPUTE_HANDOFF",
     "EPHEMERAL_CLEANUP",
 })
 
@@ -9568,22 +10163,341 @@ def enforce_max_runtime(
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
+def _dependency_cycle_present(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether persisted parent links contain a cycle through task_id."""
+    seen: set[str] = set()
+    stack = list(parent_ids(conn, task_id))
+    while stack:
+        current = stack.pop()
+        if current == task_id:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        stack.extend(parent_ids(conn, current))
+    return False
+
+
+def _latest_handoff_payload(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, HANDOFF_EVENT_KIND),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def task_recovery_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    now: Optional[int] = None,
+) -> dict:
+    """Collect bounded, persisted evidence used by the recovery classifier.
+
+    The collector does not mutate the board.  It intentionally keeps raw prose
+    out of the decision surface: summaries and redacted output are history, not
+    predicates.  Liveness, run state, heartbeats, activity timestamps,
+    dependency state, Git facts and structured handoff/nextAction data are
+    returned separately so callers can audit exactly why a classification was
+    made.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"unknown task {task_id}")
+    now_i = int(time.time()) if now is None else int(now)
+    # The active run id is authoritative even when clock skew or test fixtures
+    # make an older closed run's ``started_at`` sort later.
+    run = (
+        get_run(conn, task.current_run_id)
+        if task.current_run_id is not None
+        else latest_run(conn, task_id)
+    )
+    latest_event = conn.execute(
+        "SELECT kind, created_at FROM task_events WHERE task_id = ? "
+        "AND kind IN ('activity', 'progress', 'tool_progress') "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    activity_candidates = [
+        int(value) for value in (
+            task.last_heartbeat_at,
+            latest_event["created_at"] if latest_event else None,
+        ) if value is not None
+    ]
+    repo = repo_state_for(task)
+    if repo.get("last_commit_at") is not None:
+        activity_candidates.append(int(repo["last_commit_at"]))
+
+    target = find_mission_parent(conn, task_id) if task.role == "gate" else None
+    handoff_target = target.id if target is not None else task_id
+    handoff = _latest_handoff_payload(conn, handoff_target)
+    decision = handoff.get("decision") if isinstance(handoff, dict) else None
+    next_action = handoff.get("next_action") if isinstance(handoff, dict) else None
+    parents = task_graph_context(conn, task_id)["parents"]
+    worker_alive: Optional[bool] = None
+    if task.worker_pid:
+        worker_alive = _pid_alive(task.worker_pid)
+
+    return {
+        "taskId": task.id,
+        "status": task.status,
+        "role": task.role,
+        "blockKind": task.block_kind,
+        "claimLock": task.claim_lock,
+        "claimExpires": task.claim_expires,
+        "workerPid": task.worker_pid,
+        "workerAlive": worker_alive,
+        "currentRunId": task.current_run_id,
+        "runId": run.id if run is not None else None,
+        "runStatus": run.status if run is not None else None,
+        "runOutcome": run.outcome if run is not None else None,
+        "runStartedAt": run.started_at if run is not None else task.started_at,
+        "lastHeartbeatAt": task.last_heartbeat_at,
+        "lastActivityAt": max(activity_candidates) if activity_candidates else None,
+        "latestEventKind": latest_event["kind"] if latest_event else None,
+        "parentStatuses": [p["status"] for p in parents],
+        "dependencyCycle": _dependency_cycle_present(conn, task_id),
+        "consecutiveFailures": int(task.consecutive_failures or 0),
+        "maxRetries": task.max_retries,
+        "handoffPresent": handoff is not None,
+        "decisionClass": (
+            decision.get("decisionClass") if isinstance(decision, dict) else None
+        ),
+        "actionStatus": (
+            decision.get("actionStatus") if isinstance(decision, dict) else None
+        ),
+        "nextAction": (
+            next_action.get("type") if isinstance(next_action, dict) else None
+        ),
+        "repoState": repo,
+        "observedAt": now_i,
+    }
+
+
+def classify_task_health(
+    evidence: dict,
+    *,
+    now: Optional[int] = None,
+    stale_timeout_seconds: int = 0,
+    heartbeat_gap_seconds: int = _STALE_HEARTBEAT_GAP_SECONDS,
+) -> dict:
+    """Classify one task from corroborating evidence, never elapsed time alone.
+
+    Returns a structured classification plus the bounded next recovery action.
+    Missing or contradictory material evidence fails closed to
+    ``STATE_INCONSISTENCY / APPROVAL_REQUIRED``.  ``ACTIVE`` is the safe
+    default when remote process liveness cannot be established: the watchdog
+    must not kill legitimate long-running work merely because time elapsed.
+    """
+    now_i = int(time.time()) if now is None else int(now)
+
+    def result(
+        classification: str,
+        decision_class: str,
+        next_action: str,
+        reason: str,
+    ) -> dict:
+        heartbeat = evidence.get("lastHeartbeatAt")
+        activity = evidence.get("lastActivityAt")
+        fresh_heartbeat = (
+            heartbeat is not None
+            and now_i - int(heartbeat) < heartbeat_gap_seconds
+        )
+        fresh_activity = (
+            activity is not None
+            and now_i - int(activity) < heartbeat_gap_seconds
+        )
+        observed_running = (
+            evidence.get("status") == "running"
+            and evidence.get("currentRunId") is not None
+            and (
+                evidence.get("workerAlive") is True
+                or fresh_heartbeat
+                or fresh_activity
+            )
+        )
+        if decision_class == APPROVAL_REQUIRED:
+            observable_status = ACTION_STATUS_AWAITING_APPROVAL
+        elif observed_running and classification == ACTIVE:
+            observable_status = ACTION_STATUS_RUNNING
+        elif classification == FAILED:
+            observable_status = ACTION_STATUS_FAILED
+        elif classification == ACTIVE and evidence.get("status") == "done":
+            observable_status = ACTION_STATUS_COMPLETED
+        else:
+            observable_status = ACTION_STATUS_STARTING
+        owner_action = "REQUIRED" if decision_class == APPROVAL_REQUIRED else "NONE"
+        running_evidence = (
+            {
+                "workerPid": evidence.get("workerPid"),
+                "runId": evidence.get("currentRunId"),
+                "lastHeartbeat": heartbeat,
+                "lastActivity": activity,
+                "currentTask": evidence.get("taskId"),
+            }
+            if observable_status == ACTION_STATUS_RUNNING
+            else None
+        )
+        return {
+            "classification": classification,
+            "decisionClass": decision_class,
+            "requiresApproval": decision_class == APPROVAL_REQUIRED,
+            "nextAction": next_action,
+            "reason": reason,
+            "lastActivity": activity,
+            "actionStatus": observable_status,
+            "ownerAction": owner_action,
+            "requiredAction": next_action if owner_action == "REQUIRED" else None,
+            "why": reason,
+            "runningEvidence": running_evidence,
+        }
+
+    status = evidence.get("status")
+    run_status = evidence.get("runStatus")
+    current_run_id = evidence.get("currentRunId")
+    decision_class = evidence.get("decisionClass")
+    action_status = evidence.get("actionStatus")
+
+    contradictory_decision = (
+        decision_class == APPROVAL_REQUIRED
+        and action_status in {ACTION_STATUS_STARTING, ACTION_STATUS_EXECUTED}
+    ) or (
+        decision_class == AUTO and action_status == ACTION_STATUS_AWAITING_APPROVAL
+    )
+    contradictory_run = (
+        status == "running"
+        and current_run_id is not None
+        and (
+            evidence.get("runId") != current_run_id
+            or run_status != "running"
+        )
+    ) or (status != "running" and current_run_id is not None)
+    if contradictory_decision or contradictory_run:
+        return result(
+            STATE_INCONSISTENCY,
+            APPROVAL_REQUIRED,
+            "CONFIRM_PERSISTED_STATE",
+            "Persisted run or nextAction evidence is contradictory; no automatic mutation is safe.",
+        )
+
+    if status == "done" and evidence.get("role") == "gate" and not evidence.get("handoffPresent"):
+        return result(
+            COMPLETED_UNHANDED,
+            AUTO,
+            "RECOMPUTE_HANDOFF",
+            "The final gate completed but has no persisted terminal handoff.",
+        )
+
+    if status == "blocked":
+        parent_statuses = evidence.get("parentStatuses") or []
+        if evidence.get("dependencyCycle") or (
+            evidence.get("blockKind") == "dependency"
+            and parent_statuses
+            and all(p == "blocked" for p in parent_statuses)
+        ):
+            return result(
+                DEPENDENCY_DEADLOCK,
+                APPROVAL_REQUIRED,
+                "RECONCILE_DEPENDENCY",
+                "Dependencies cannot advance and no directly proven reversible edge was supplied.",
+            )
+        return result(
+            APPROVAL_BLOCKED,
+            APPROVAL_REQUIRED,
+            "AWAITING_DECISION",
+            "The task carries a persisted block and requires an explicit owner decision.",
+        )
+
+    latest_outcome = str(evidence.get("runOutcome") or "").lower()
+    if status in {"ready", "review", "todo"} and latest_outcome in {
+        "failed", "crashed", "timed_out", "spawn_failed",
+    }:
+        limit = evidence.get("maxRetries")
+        failures = int(evidence.get("consecutiveFailures") or 0)
+        if limit is not None and failures >= int(limit):
+            return result(
+                APPROVAL_BLOCKED,
+                APPROVAL_REQUIRED,
+                "AWAITING_DECISION",
+                "The bounded retry budget is exhausted.",
+            )
+        return result(
+            FAILED,
+            AUTO,
+            "WORKER_RETRY",
+            "The latest run failed and the bounded retry path remains available.",
+        )
+
+    if status == "running":
+        worker_alive = evidence.get("workerAlive")
+        broken_claim = not evidence.get("claimLock") or evidence.get("claimExpires") is None
+        if worker_alive is False:
+            return result(
+                ORPHANED,
+                AUTO,
+                "WORKER_RETRY",
+                "The persisted worker process is no longer alive.",
+            )
+        if broken_claim and worker_alive is not True:
+            return result(
+                ORPHANED,
+                AUTO,
+                "WORKER_RETRY",
+                "The running task has no valid claim and no live worker evidence.",
+            )
+
+        started = evidence.get("runStartedAt")
+        elapsed = now_i - int(started) if started is not None else 0
+        heartbeat = evidence.get("lastHeartbeatAt")
+        heartbeat_age = now_i - int(heartbeat) if heartbeat is not None else None
+        activity = evidence.get("lastActivityAt")
+        activity_age = now_i - int(activity) if activity is not None else None
+        old_enough = stale_timeout_seconds > 0 and elapsed >= stale_timeout_seconds
+        heartbeat_stale = heartbeat_age is None or heartbeat_age >= heartbeat_gap_seconds
+        activity_stale = activity_age is None or activity_age >= heartbeat_gap_seconds
+        if old_enough and heartbeat_stale and activity_stale:
+            return result(
+                STALLED,
+                AUTO,
+                "WORKER_RETRY",
+                "Elapsed time is corroborated by stale heartbeat, stale activity, and absent process progress.",
+            )
+
+    return result(
+        ACTIVE,
+        AUTO,
+        evidence.get("nextAction") or "AWAITING_WORKERS",
+        "Persisted workflow evidence is consistent; no recovery mutation is required.",
+    )
+
+
 def detect_stale_running(
     conn: sqlite3.Connection,
     *,
     stale_timeout_seconds: int = 0,
     signal_fn=None,
 ) -> list[str]:
-    """Reclaim ``running`` tasks that show no progress (heartbeat) within the
-    staleness window.
+    """Reclaim ``running`` tasks whose lack of progress is corroborated.
 
-    A task is considered stale when BOTH of these hold:
+    A task is considered stale when all of these hold:
 
     1. It has been running for longer than ``stale_timeout_seconds``
        (measured from the active run's ``started_at``, falling back to
        ``tasks.started_at`` on older runs).
     2. Its ``last_heartbeat_at`` is older than
        ``_STALE_HEARTBEAT_GAP_SECONDS`` (or NULL — never sent a heartbeat).
+    3. No recent persisted activity or Git commit corroborates progress.
+    4. Current run/claim/process evidence is internally consistent with a
+       stalled run. Dead workers are handled separately as ``ORPHANED``.
 
     On reclaim the task is restored to its source phase, the run is closed with
     ``outcome='stale'``, and the host-local worker (if still running) is
@@ -9629,6 +10543,19 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
+        # Elapsed time + an absent heartbeat is suspicion, not proof.  Fold in
+        # independent persisted activity and process/run evidence before the
+        # watchdog mutates anything.  This is the same reusable classifier
+        # exposed to diagnostics and Mission Control projections.
+        evidence = task_recovery_evidence(conn, tid, now=now)
+        health = classify_task_health(
+            evidence,
+            now=now,
+            stale_timeout_seconds=stale_timeout_seconds,
+        )
+        if health["classification"] != STALLED:
+            continue
+
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
@@ -9657,6 +10584,16 @@ def detect_stale_running(
                 continue
 
             payload = {
+                "healthClassification": STALLED,
+                "decisionClass": AUTO,
+                "actionStatus": ACTION_STATUS_RECOVERING,
+                "ownerAction": "NONE",
+                "nextAction": "WORKER_RETRY",
+                "lastActivity": health.get("lastActivity"),
+                "operatorMessage": (
+                    "RÉCUPÉRATION AUTO — stall corroboré; nouvelle tentative "
+                    "planifiée, aucune action opérateur requise."
+                ),
                 "elapsed_seconds": int(elapsed),
                 "last_heartbeat_at": (
                     int(last_hb) if last_hb is not None else None
@@ -9753,6 +10690,15 @@ def reconcile_orphaned_running(
                 continue
             payload = {
                 "reason": "orphaned_running",
+                "healthClassification": ORPHANED,
+                "decisionClass": AUTO,
+                "actionStatus": ACTION_STATUS_RECOVERING,
+                "ownerAction": "NONE",
+                "nextAction": "WORKER_RETRY",
+                "operatorMessage": (
+                    "RÉCUPÉRATION AUTO — worker orphelin récupéré; "
+                    "nouvelle tentative planifiée, aucune action opérateur requise."
+                ),
                 "claim_lock": row["claim_lock"],
                 "claim_expires": (
                     int(row["claim_expires"])
@@ -10000,6 +10946,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
+            if event_kind == "crashed":
+                event_payload.update({
+                    "healthClassification": ORPHANED,
+                    "decisionClass": AUTO,
+                    "actionStatus": ACTION_STATUS_RECOVERING,
+                    "ownerAction": "NONE",
+                    "nextAction": "WORKER_RETRY",
+                    "operatorMessage": (
+                        "RÉCUPÉRATION AUTO — worker disparu récupéré; nouvelle "
+                        "tentative planifiée, aucune action opérateur requise."
+                    ),
+                })
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "

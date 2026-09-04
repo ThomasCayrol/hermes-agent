@@ -454,9 +454,8 @@ def test_resolve_next_action_accepts_legacy_approvals_policy():
 # ---------------------------------------------------------------------------
 
 
-def test_handoff_rejected_gate_records_auto_remediation_and_continue(conn):
-    """Gate REJECTED -> REMEDIATION AUTO: the handoff comment + event carry
-    the decision block, action status STARTING, and an auto_continue event."""
+def test_handoff_rejected_gate_records_planned_auto_remediation(conn):
+    """AUTO authorizes remediation without claiming execution has begun."""
     umbrella, gate = _run_gate_mission(
         conn,
         result="REJECT",
@@ -469,8 +468,10 @@ def test_handoff_rejected_gate_records_auto_remediation_and_continue(conn):
     comments = _handoff_comments(conn, umbrella)
     assert len(comments) == 1
     assert "Decision class: AUTO" in comments[0]
-    assert "started automatically" in comments[0]
-    assert "Action status: STARTING" in comments[0]
+    assert "ACTION AUTO PLANIFIÉE" in comments[0]
+    assert "OWNER ACTION: NONE" in comments[0]
+    assert "ACTION STATUS: STARTING" in comments[0]
+    assert "started automatically" not in comments[0]
     assert "Analysis:" in comments[0]
 
     newest = _newest_handoff(conn, umbrella)
@@ -478,6 +479,7 @@ def test_handoff_rejected_gate_records_auto_remediation_and_continue(conn):
     assert decision["actionType"] == "REMEDIATION"
     assert decision["decisionClass"] == kb.AUTO
     assert decision["actionStatus"] == kb.ACTION_STATUS_STARTING
+    assert decision["ownerAction"] == "NONE"
     assert decision["requiresApproval"] is False
     assert decision["rationale"]
     assert decision["analysis"].startswith("Final gate")
