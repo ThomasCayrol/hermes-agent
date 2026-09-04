@@ -352,8 +352,8 @@ function Diagnostics({
               <div className="flex flex-wrap gap-1.5">
                 {actions.map(action => (
                   <Button
-                    key={`${action.kind}-${action.label}`}
                     disabled={diagBusy && action.kind === 'run_diagnostics'}
+                    key={`${action.kind}-${action.label}`}
                     onClick={() => act(action)}
                     size="xs"
                     variant={action.suggested ? 'secondary' : 'outline'}
