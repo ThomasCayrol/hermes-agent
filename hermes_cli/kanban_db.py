@@ -6358,16 +6358,43 @@ def _terminal_probe_evidence(
         (umbrella.id, HANDOFF_EVENT_KIND),
     ).fetchone()
     now_ts = int(time.time()) if now is None else int(now)
+    window = max(0, int(window_seconds))
+    # SEC-PROBE-001 (reprise) : un journal ARCHIVE_READY déjà émis est une
+    # décision d'archive déjà enregistrée par un tick précédent (le crash peut
+    # interrompre la routine entre le journal et l'archive effective). Il
+    # autorise la continuation quelle que soit la classe du dernier handoff.
+    archive_ready_journaled = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+        (umbrella.id, TERMINAL_PROBE_CLEANUP_EVENT_KIND),
+    ).fetchone() is not None
+
+    latest_action_status: Optional[str] = None
     if latest_handoff and latest_handoff["payload"]:
         try:
             latest_payload = json.loads(latest_handoff["payload"]) or {}
         except Exception:
             return None
         latest_decision = latest_payload.get("decision") or {}
-        if latest_decision.get("actionStatus") == ACTION_STATUS_STARTING:
-            window = max(0, int(window_seconds))
-            if now_ts - int(latest_handoff["created_at"]) < window:
-                return None
+        latest_action_status = latest_decision.get("actionStatus")
+        # SEC-PROBE-002 : la fenêtre bornée s'applique quel que soit
+        # l'actionStatus du dernier handoff (pas seulement STARTING) — un
+        # handoff récent (AWAITING_APPROVAL, APPROVAL_REQUIRED, EXECUTED…)
+        # est un signal d'attention récent qui suspend toute décision
+        # d'archive jusqu'à expiration de la fenêtre.
+        if not archive_ready_journaled and now_ts - int(latest_handoff["created_at"]) < window:
+            return None
+
+    if identity_source == "legacy_derived" and not archive_ready_journaled:
+        # SEC-PROBE-001 fail-closed : l'identité legacy dérivée
+        # (assignee IS NULL) ne prouve pas à elle seule qu'une mission est
+        # synthétique — une mission RÉELLE umbrella non assignée dont le
+        # dernier handoff est APPROVAL_REQUIRED / AWAITING_APPROVAL /
+        # OWNER_ACTION_REQUIRED (ou qui n'a aucun handoff) ne doit JAMAIS être
+        # archivée sans mission_kind structuré. Seule la signature
+        # stale-STARTING (dernier handoff STARTING + fenêtre écoulée) autorise
+        # l'auto-archive d'une mission legacy dérivée.
+        if latest_action_status != ACTION_STATUS_STARTING:
+            return None
 
     return {
         "mission_kind": umbrella.mission_kind,
