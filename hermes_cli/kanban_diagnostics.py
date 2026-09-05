@@ -50,6 +50,123 @@ def severity_at_or_above(severity: Optional[str], threshold: Optional[str]) -> b
     return SEVERITY_ORDER.index(severity) >= SEVERITY_ORDER.index(threshold)
 
 
+# ---------------------------------------------------------------------------
+# Operator attention axis (Operator Diagnostics Clarity contract)
+#
+# Every Diagnostic carries TWO orthogonal axes:
+#   * technical severity (warning/error/critical, above) — unchanged,
+#     used for triage order and legacy colouring;
+#   * operator attention (NONE/INFO/WARNING/ACTION_REQUIRED/CRITICAL) —
+#     what the OPERATOR should do about it. A diagnostic may exist with
+#     NONE/INFO attention (e.g. a healthy, legitimately-queued task); its
+#     emission never implies the operator must act.
+# ---------------------------------------------------------------------------
+ATTENTION_NONE = "NONE"
+ATTENTION_INFO = "INFO"
+ATTENTION_WARNING = "WARNING"
+ATTENTION_ACTION_REQUIRED = "ACTION_REQUIRED"
+ATTENTION_CRITICAL = "CRITICAL"
+ATTENTION_ORDER = (
+    ATTENTION_NONE,
+    ATTENTION_INFO,
+    ATTENTION_WARNING,
+    ATTENTION_ACTION_REQUIRED,
+    ATTENTION_CRITICAL,
+)
+
+# Owner action: REQUIRED exactly when attention is ACTION_REQUIRED/CRITICAL.
+# WARNING = recommended action, never a hard requirement.
+OWNER_ACTION_NONE = "NONE"
+OWNER_ACTION_REQUIRED = "REQUIRED"
+
+# Auto-recovery lifecycle states reflected by diagnostics. The ENGINE only
+# renders states evidenced by events/board context — it never executes the
+# recovery itself (that belongs to the dispatcher / stall watchdog lane).
+AUTO_RECOVERY_NONE = "none"
+AUTO_RECOVERY_IN_PROGRESS = "in_progress"
+AUTO_RECOVERY_SUCCEEDED = "succeeded"
+AUTO_RECOVERY_FAILED = "failed"
+AUTO_RECOVERY_STATES = (
+    AUTO_RECOVERY_NONE,
+    AUTO_RECOVERY_IN_PROGRESS,
+    AUTO_RECOVERY_SUCCEEDED,
+    AUTO_RECOVERY_FAILED,
+)
+
+# stranded_in_ready classifier outcomes (Product contract §3).
+CLASSIFICATION_LEGITIMATELY_QUEUED = "LEGITIMATELY_QUEUED"
+CLASSIFICATION_READY_TOO_LONG_UNEXPLAINED = "READY_TOO_LONG_UNEXPLAINED"
+CLASSIFICATION_NO_COMPATIBLE_WORKER = "NO_COMPATIBLE_WORKER"
+CLASSIFICATION_DISPATCHER_UNHEALTHY = "DISPATCHER_UNHEALTHY"
+CLASSIFICATION_PROFILE_CAPACITY_SATURATED = "PROFILE_CAPACITY_SATURATED"
+STRANDED_CLASSIFICATIONS = (
+    CLASSIFICATION_LEGITIMATELY_QUEUED,
+    CLASSIFICATION_READY_TOO_LONG_UNEXPLAINED,
+    CLASSIFICATION_NO_COMPATIBLE_WORKER,
+    CLASSIFICATION_DISPATCHER_UNHEALTHY,
+    CLASSIFICATION_PROFILE_CAPACITY_SATURATED,
+)
+
+# Recovery lifecycle events this engine recognises (read-only markers).
+# Bounded + non-overlapping with the stall watchdog semantics (t_60c940e3
+# lane owns execution); when the merged watchdog emits these event kinds
+# the engine picks them up automatically.
+EVENT_RECOVERY_STARTED = "recovery_started"
+EVENT_RECOVERING = "recovering"
+EVENT_RECOVERY_SUCCEEDED = "recovery_succeeded"
+EVENT_RECOVERY_FAILED = "recovery_failed"
+_RECOVERY_START_KINDS = {EVENT_RECOVERY_STARTED, EVENT_RECOVERING}
+_RECOVERY_TERMINAL_KINDS = {EVENT_RECOVERY_SUCCEEDED, EVENT_RECOVERY_FAILED}
+
+
+def attention_at_or_above(attention: Optional[str], threshold: Optional[str]) -> bool:
+    """Return True when ``attention`` meets or exceeds ``threshold``."""
+    if threshold is None:
+        return True
+    if attention not in ATTENTION_ORDER or threshold not in ATTENTION_ORDER:
+        return False
+    return ATTENTION_ORDER.index(attention) >= ATTENTION_ORDER.index(threshold)
+
+
+def owner_action_for_attention(attention: Optional[str]) -> str:
+    """Derive the owner-action field from the attention level.
+
+    REQUIRED exactly when attention is ACTION_REQUIRED or CRITICAL; every
+    other level is NONE (recommendations travel as suggested actions).
+    """
+    if attention in (ATTENTION_ACTION_REQUIRED, ATTENTION_CRITICAL):
+        return OWNER_ACTION_REQUIRED
+    return OWNER_ACTION_NONE
+
+
+def attention_banner_policy(
+    *,
+    attention: str,
+    auto_recovery_state: str = AUTO_RECOVERY_NONE,
+    abnormal: bool = True,
+    auto_recoverable: bool = False,
+) -> bool:
+    """Attention-banner decision (Product contract §5) — the ONLY place the
+    ``attention_banner`` flag is decided; surfaces filter/render it, they do
+    not re-derive it.
+
+    A diagnostic lands in the operator attention banner iff:
+      * its auto-recovery FAILED, or
+      * its attention is CRITICAL or ACTION_REQUIRED, or
+      * it is an abnormal WARNING that Hermes cannot auto-recover.
+    Healthy queue/capacity conditions (INFO/NONE) never banner.
+    """
+    if auto_recovery_state == AUTO_RECOVERY_FAILED:
+        return True
+    if attention == ATTENTION_CRITICAL:
+        return True
+    if owner_action_for_attention(attention) == OWNER_ACTION_REQUIRED:
+        return True
+    if attention == ATTENTION_WARNING and abnormal and not auto_recoverable:
+        return True
+    return False
+
+
 @dataclass
 class DiagnosticAction:
     """A single recovery action attached to a diagnostic.
@@ -60,11 +177,18 @@ class DiagnosticAction:
       endpoint; dashboard wires into the existing recovery popover.
     * ``unblock`` — PATCH status back to ``ready`` (for stuck-blocked
       diagnostics).
-    * ``cli_hint`` — print/copy a shell command (e.g.
-      ``hermes -p <profile> auth``). No HTTP side effect.
-    * ``open_docs`` — deep-link to the docs URL named in ``payload.url``.
     * ``comment`` — nudge the operator to add a comment (for
       stuck-blocked tasks that need human input).
+    * ``run_diagnostics`` — run a read-only diagnostics pass (board /
+      dispatcher) — the primary replacement for the old opaque
+      ``cli_hint`` "Check dispatcher status".
+    * ``view_worker`` / ``view_queue`` — read-only navigation to the
+      active worker log / the profile's ready queue.
+    * ``open_docs`` — deep-link to the docs URL named in ``payload.url``.
+    * ``cli_hint`` — print/copy a shell command (e.g.
+      ``hermes -p <profile> auth``). No HTTP side effect; surfaces render
+      it as a SECONDARY affordance only (discreet copy icon), never as the
+      primary button.
 
     ``suggested=True`` marks the action as the recommended first step;
     the UI highlights it. Multiple actions can be suggested if they're
@@ -101,8 +225,36 @@ class Diagnostic:
     run_id: Optional[int] = None
     # Optional structured payload for the UI (phantom ids, failure count).
     data: dict = field(default_factory=dict)
+    # --- Operator attention axis (additive over ``severity``). Decided by
+    # the rule that emits the diagnostic, finalised in
+    # :func:`_finalize_operator_fields`; surfaces render, never re-derive. ---
+    attention: str = ATTENTION_INFO
+    # owner_action is derived from attention (NONE|REQUIRED) in the finalizer.
+    owner_action: str = OWNER_ACTION_NONE
+    # Short FR sentence: what Hermes does automatically about this state.
+    system_action: str = ""
+    # Whether the diagnostic counts toward the operator attention banner.
+    # None = resolve via :func:`attention_banner_policy` in the finalizer.
+    attention_banner: Optional[bool] = None
+    auto_recovery_state: str = AUTO_RECOVERY_NONE
+    # stranded_in_ready classifier outcome (one of STRANDED_CLASSIFICATIONS).
+    classification: Optional[str] = None
+    # --- Operator message (FR copy; technical details stay in title/detail/
+    # data, always EN). Section labels rendered by surfaces stay EN:
+    # STATUS / CAUSE / IMPACT / OWNER ACTION / SYSTEM ACTION. ---
+    operator_status: str = ""
+    operator_cause: str = ""
+    operator_impact: str = ""
+    # Replaces operator_impact for concurrency kinds (STATUS/CAUSE/RISK/…).
+    operator_risk: str = ""
 
     def to_dict(self) -> dict:
+        banner = self.attention_banner
+        if banner is None:
+            banner = attention_banner_policy(
+                attention=self.attention,
+                auto_recovery_state=self.auto_recovery_state,
+            )
         return {
             "kind": self.kind,
             "severity": self.severity,
@@ -114,6 +266,17 @@ class Diagnostic:
             "count": self.count,
             "run_id": self.run_id,
             "data": self.data,
+            # Operator attention axis
+            "attention": self.attention,
+            "owner_action": owner_action_for_attention(self.attention),
+            "system_action": self.system_action,
+            "attention_banner": banner,
+            "auto_recovery_state": self.auto_recovery_state,
+            "classification": self.classification,
+            "operator_status": self.operator_status,
+            "operator_cause": self.operator_cause,
+            "operator_impact": self.operator_impact,
+            "operator_risk": self.operator_risk,
         }
 
 
@@ -208,6 +371,106 @@ def _generic_recovery_actions(task: Any, *, running: bool) -> list[DiagnosticAct
         payload={"reclaim_first": running},
     ))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Operator-axis helpers (FR operator copy; canonical technical terms stay EN)
+# ---------------------------------------------------------------------------
+
+
+def _fmt_age(age_seconds: float) -> str:
+    """Render a duration in an operator-readable unit (45m / 2h / 1j)."""
+    if age_seconds >= 86400:
+        return f"{age_seconds / 86400:.1f}j"
+    if age_seconds >= 3600:
+        return f"{age_seconds / 3600:.1f}h"
+    return f"{int(age_seconds / 60)}m"
+
+
+def _op(
+    *,
+    attention: str = ATTENTION_INFO,
+    system_action: str = "",
+    status: str = "",
+    cause: str = "",
+    impact: str = "",
+    risk: str = "",
+    classification: Optional[str] = None,
+    auto_recovery_state: str = AUTO_RECOVERY_NONE,
+) -> dict:
+    """Keyword bundle for the operator fields of a Diagnostic constructor.
+
+    ``owner_action`` is derived from ``attention`` by the finalizer, so rules
+    never set it by hand. ``attention_banner`` is resolved by the policy in
+    the finalizer unless a rule passes it explicitly.
+    """
+    return {
+        "attention": attention,
+        "owner_action": owner_action_for_attention(attention),
+        "system_action": system_action,
+        "auto_recovery_state": auto_recovery_state,
+        "classification": classification,
+        "operator_status": status,
+        "operator_cause": cause,
+        "operator_impact": impact,
+        "operator_risk": risk,
+    }
+
+
+def _run_diagnostics_action(*, suggested: bool = False) -> DiagnosticAction:
+    """Primary action replacing the opaque \"Check dispatcher status\" CLI
+    hint: a real read-only diagnostics run (board-level)."""
+    return DiagnosticAction(
+        kind="run_diagnostics",
+        label="Diagnostiquer le dispatcher",
+        payload={"command": "hermes kanban diagnostics"},
+        suggested=suggested,
+    )
+
+
+def _view_worker_action(worker_id: Optional[str] = None) -> DiagnosticAction:
+    payload = {}
+    if worker_id:
+        payload["worker_id"] = worker_id
+    return DiagnosticAction(
+        kind="view_worker",
+        label="Voir le worker actif",
+        payload=payload,
+    )
+
+
+def _view_queue_action(profile: str) -> DiagnosticAction:
+    return DiagnosticAction(
+        kind="view_queue",
+        label=f"Voir la file {profile}",
+        payload={"profile": profile},
+    )
+
+
+def _secondary_cli_hint(command: str, label: Optional[str] = None) -> DiagnosticAction:
+    """Raw CLI command affordance — SECONDARY only (never suggested)."""
+    return DiagnosticAction(
+        kind="cli_hint",
+        label=label or f"Copier la commande : {command}",
+        payload={"command": command},
+        suggested=False,
+    )
+
+
+def _task_scope_key(task: Any) -> Optional[tuple]:
+    """Stable identity of the repo+branch a task writes to.
+
+    Returns ``None`` when the task has no scoped workspace, so concurrency
+    detection never groups unscoped tasks together.
+    """
+    ws = str(_task_field(task, "workspace_path") or "").strip()
+    branch = str(_task_field(task, "branch_name") or "").strip()
+    if not ws and not branch:
+        return None
+    project = str(_task_field(task, "project_id") or "").strip()
+    # project_id is the "scope" discriminator when present; two tasks in the
+    # same repo on the same branch under different projects are not dupes.
+    return (ws or None, branch or None, project or None)
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +1095,13 @@ def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task has been in ``blocked`` status for too long without a comment.
 
     Threshold: cfg["blocked_stale_hours"] (default 24).
+
+    Approval fast-path (Operator Diagnostics Clarity case E): when the most
+    recent block explicitly carries an approval decision (payload
+    ``decision_class=APPROVAL_REQUIRED`` or a reason mentioning "approval"),
+    the diagnostic fires IMMEDIATELY at ACTION_REQUIRED — a task awaiting an
+    owner decision must not sit silently for 24h.
+
     Surfaced as a warning so humans know there's a pending unblock.
     """
     hours = float(cfg.get("blocked_stale_hours", 24))
@@ -840,31 +1110,96 @@ def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
         return []
     # Find the most recent ``blocked`` event.
     last_blocked_ts = 0
+    latest_block = None
     for ev in events:
         if _event_kind(ev) == "blocked":
             t = _event_ts(ev)
-            last_blocked_ts = max(last_blocked_ts, t)
+            if t >= last_blocked_ts:
+                last_blocked_ts = t
+                latest_block = ev
     if last_blocked_ts == 0:
         return []
     age_hours = (now - last_blocked_ts) / 3600.0
-    if age_hours < hours:
+
+    block_payload = _parse_payload(latest_block)
+    reason = str(block_payload.get("reason") or "").strip()
+    decision_class = str(block_payload.get("decision_class") or "").strip()
+    approval_block = (
+        decision_class.upper() == "APPROVAL_REQUIRED"
+        or "approval" in reason.lower()
+    )
+    if not approval_block and age_hours < hours:
         return []
-    # Any comment / unblock after the block breaks the "stale" signal.
+    # Any comment / unblock after the block breaks the "stale" signal —
+    # except an explicit approval block, which stays live until answered.
     for ev in events:
-        if _event_kind(ev) in {"commented", "unblocked"} and _event_ts(ev) > last_blocked_ts:
+        if (
+            not approval_block
+            and _event_kind(ev) in {"commented", "unblocked"}
+            and _event_ts(ev) > last_blocked_ts
+        ):
             return []
-    actions: list[DiagnosticAction] = [
-        DiagnosticAction(
+
+    task_id = str(_task_field(task, "id") or "")
+    actions: list[DiagnosticAction] = []
+    if approval_block:
+        actions.append(DiagnosticAction(
+            kind="comment",
+            label="Répondre à la demande d'approbation",
+            suggested=True,
+        ))
+        actions.append(DiagnosticAction(
+            kind="unblock",
+            label="Débloquer la tâche",
+            payload={},
+        ))
+    else:
+        actions.append(DiagnosticAction(
             kind="comment",
             label="Add a comment / unblock the task",
             suggested=True,
-        ),
-    ]
-    return [Diagnostic(
+        ))
+
+    data: dict = {"blocked_at": last_blocked_ts, "age_hours": round(age_hours, 1)}
+    if approval_block:
+        why = reason or (
+            "Décision APPROVAL_REQUIRED (déterministe, irréversible ou hors "
+            "périmètre AUTO)."
+        )
+        data.update({
+            "decision_class": "APPROVAL_REQUIRED",
+            "required_action": f"Approuver la suite de la tâche {task_id}",
+            "why": why,
+        })
+    title = (
+        "En attente de votre approbation — aucune progression automatique possible"
+        if approval_block else
+        f"Task has been blocked for {int(age_hours)}h"
+    )
+    op_status = (
+        "En attente de votre approbation — aucune progression automatique possible."
+        if approval_block else
+        "Tâche bloquée sans échange récent."
+    )
+    op_cause = (
+        f"Décision {decision_class or 'APPROVAL_REQUIRED'} demandée : {reason or 'approbation requise'}."
+        if approval_block else
+        "Aucun commentaire ni tentative d'unblock depuis le passage en blocked."
+    )
+    op_impact = "La suite du workflow est suspendue."
+    op_system = (
+        "Aucune — le workflow attend votre décision explicite."
+        if approval_block else
+        "Aucune — une tâche bloquée attend une décision humaine."
+    )
+    diag = Diagnostic(
         kind="stuck_in_blocked",
         severity="warning",
-        title=f"Task has been blocked for {int(age_hours)}h",
+        title=title,
         detail=(
+            "This task is blocked awaiting an explicit operator approval "
+            "(decision_class=APPROVAL_REQUIRED)."
+            if approval_block else
             f"This task transitioned to blocked {int(age_hours)}h ago and "
             f"has had no comments or unblock attempts since. Blocked tasks "
             f"are waiting for human input — check the block reason and "
@@ -874,8 +1209,17 @@ def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
         first_seen_at=last_blocked_ts,
         last_seen_at=last_blocked_ts,
         count=1,
-        data={"blocked_at": last_blocked_ts, "age_hours": round(age_hours, 1)},
-    )]
+        data=data,
+        **_op(
+            attention=ATTENTION_ACTION_REQUIRED,
+            system_action=op_system,
+            status=op_status,
+            cause=op_cause,
+            impact=op_impact,
+        ),
+    )
+    diag.attention_banner = True
+    return [diag]
 
 
 def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic]:
@@ -955,32 +1299,416 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     )]
 
 
+def _stranded_evidence(task: Any, board_context: Optional[dict], now: int) -> dict:
+    """Pull the classifier's decision inputs from the read-only board context.
+
+    Fail-safe: any input that is ABSENT stays ``None``/``False``-neutral —
+    absence of evidence is never treated as health (Product contract §3.2).
+    Callers build the context via :func:`build_board_context` or by hand
+    (tests / Mission Control projection).
+    """
+    bc = board_context or {}
+    assignee = str(_task_field(task, "assignee") or "").strip()
+    task_id = str(_task_field(task, "id") or "")
+
+    running_map = bc.get("running_by_assignee") or {}
+    queue_map = bc.get("queue_by_assignee") or {}
+    progressed_map = bc.get("queue_progressed_by_assignee") or {}
+    slot_map = bc.get("expected_slot_freed_by_assignee") or {}
+    attempts_map = bc.get("attempts_by_task") or {}
+
+    running = [dict(s) for s in (running_map.get(assignee) or [])]
+    queue = list(queue_map.get(assignee) or [])
+    position = None
+    for i, q in enumerate(queue):
+        if str(q.get("id") or "") == task_id:
+            position = i
+            break
+
+    # Assignee validity: positive proof comes from the roster (profiles +
+    # registered lanes). Invalid is only claimed when the roster is known and
+    # the assignee is in neither set.
+    profiles = bc.get("profiles")
+    lanes = bc.get("lanes")
+    assignee_valid: Optional[bool] = None
+    compatible: Optional[bool] = None
+    if isinstance(profiles, list):
+        if assignee in profiles:
+            assignee_valid = True
+            compatible = True
+        else:
+            lane_spawnable = lanes.get(assignee) if isinstance(lanes, dict) else None
+            if lane_spawnable is not None:
+                assignee_valid = True
+                compatible = bool(lane_spawnable)
+            elif isinstance(lanes, dict):
+                assignee_valid = False
+                compatible = False
+
+    return {
+        "assignee": assignee,
+        "dispatcher": bc.get("dispatcher"),
+        "profiles": profiles,
+        "lanes": lanes,
+        "profile_cap": bc.get("profile_cap"),
+        "board_cap": bc.get("board_cap"),
+        "assignee_valid": assignee_valid,
+        "compatible_worker_available": compatible,
+        "running": running,
+        "queue_position": position,
+        "priority": _task_field(task, "priority", 0),
+        "queue_progression": bool(progressed_map.get(assignee)),
+        "expected_slot_availability": bool(slot_map.get(assignee)),
+        "ever_attempted": bool((attempts_map.get(task_id) or 0) > 0),
+    }
+
+
+def _age_technical_severity(age_seconds: float, threshold_seconds: float) -> str:
+    """Age-based technical severity for stranded tasks (unchanged rungs:
+    warning below 2x, error to 6x, critical beyond)."""
+    if age_seconds >= threshold_seconds * 6:
+        return "critical"
+    if age_seconds >= threshold_seconds * 2:
+        return "error"
+    return "warning"
+
+
+def _unexplained_outcome(evidence: dict, age_seconds: float, threshold_seconds: float) -> dict:
+    """Build the conservative READY_TOO_LONG_UNEXPLAINED outcome (fail-safe).
+
+    Attention escalates with age: WARNING below 2x threshold,
+    ACTION_REQUIRED to 6x, CRITICAL beyond. Banner always on — an abnormal,
+    non-auto-recoverable condition.
+    """
+    dispatcher = evidence["dispatcher"]
+    dispatcher_healthy = (
+        isinstance(dispatcher, dict) and dispatcher.get("healthy") is True
+    )
+    severity = _age_technical_severity(age_seconds, threshold_seconds)
+    if age_seconds >= threshold_seconds * 6:
+        attention = ATTENTION_CRITICAL
+    elif age_seconds >= threshold_seconds * 2:
+        attention = ATTENTION_ACTION_REQUIRED
+    else:
+        attention = ATTENTION_WARNING
+    assignee = evidence["assignee"]
+    cause_bits = [
+        f"Assignee {assignee} valide" if evidence["assignee_valid"] is True else
+        "Assignee non vérifiable",
+    ]
+    if dispatcher_healthy:
+        cause_bits.append("dispatcher sain")
+    cause_bits.append("capacité disponible et aucun claim observé dans la fenêtre")
+    if evidence["expected_slot_availability"]:
+        cause_bits.append("un slot s'est libéré sans que la tâche soit prise")
+    cause_bits.append("aucune explication légitime (la file n'avance pas)")
+    return {
+        "classification": CLASSIFICATION_READY_TOO_LONG_UNEXPLAINED,
+        "attention": attention,
+        "banner": attention_banner_policy(attention=attention),
+        "severity": severity,
+        "title": f"Prête depuis {_fmt_age(age_seconds)} — aucun worker ne l'a réclamée",
+        "status": (
+            f"Prête depuis {_fmt_age(age_seconds)} — capacité disponible et aucun "
+            "worker ne l'a réclamée."
+        ),
+        "cause": "; ".join(cause_bits) + ".",
+        "impact": (
+            "La tâche ne progresse pas alors qu'elle pourrait être exécutée."
+        ),
+        "system_action": "Hermes continue de proposer la tâche à chaque tick.",
+        "data_extra": {
+            "expected_slot_availability": evidence["expected_slot_availability"],
+            "queue_position": evidence["queue_position"],
+            "ever_attempted": evidence["ever_attempted"],
+        },
+    }
+
+
+def _classify_ready_outcome(
+    evidence: dict,
+    age_seconds: float,
+    threshold_seconds: float,
+) -> dict:
+    """Classify a stranded ready task into one of the 5 normative outcomes.
+
+    Returns a dict of the outcome's operator fields:
+    ``classification / attention / banner / severity / title / status /
+    cause / impact / system_action``.
+    """
+    assignee = evidence["assignee"]
+    dispatcher = evidence["dispatcher"]
+    running = evidence["running"]
+    cap = evidence["profile_cap"] or evidence["board_cap"]
+
+    # P1 — dispatcher unhealth requires dispatcher EVIDENCE, never age alone.
+    if isinstance(dispatcher, dict) and dispatcher.get("healthy") is False:
+        board_impact = bool(dispatcher.get("board_impact"))
+        attention = ATTENTION_CRITICAL if board_impact else ATTENTION_ACTION_REQUIRED
+        return {
+            "classification": CLASSIFICATION_DISPATCHER_UNHEALTHY,
+            "attention": attention,
+            "banner": True,
+            "severity": "critical" if board_impact else "error",
+            "title": "Dispatcher suspect — pas de tick récent",
+            "status": "Dispatcher suspect — pas de tick récent.",
+            "cause": (
+                "Aucune activité dispatcher observée dans la fenêtre "
+                "(lock/heartbeat/tick)."
+            ),
+            "impact": (
+                "Plusieurs profiles et files sont affamés (impact board)."
+                if board_impact else
+                "Cette tâche et sa file ne progressent pas."
+            ),
+            "system_action": "Aucune — le dispatcher n'émet plus de tick.",
+            "data_extra": {
+                "dispatcher_board_impact": board_impact,
+                "dispatcher_last_observed_ts": dispatcher.get("last_tick_ts"),
+            },
+        }
+
+    # P2 — no compatible worker (proven roster mismatch).
+    if evidence["assignee_valid"] is False or evidence["compatible_worker_available"] is False:
+        return {
+            "classification": CLASSIFICATION_NO_COMPATIBLE_WORKER,
+            "attention": ATTENTION_ACTION_REQUIRED,
+            "banner": True,
+            "severity": "error",
+            "title": f"Aucun worker compatible pour le profile {assignee}",
+            "status": (
+                f"Aucun worker compatible pour le profile {assignee} "
+                "(assignee invalide ou lane indisponible)."
+            ),
+            "cause": (
+                f"Le profile/lane {assignee} n'est pas dans le roster "
+                "(profiles/lanes enregistrés) ou n'est pas spawnable."
+            ),
+            "impact": (
+                "Cette tâche ne sera jamais claimée tant que l'assignee "
+                "n'est pas corrigé."
+            ),
+            "system_action": (
+                "Aucune — Hermes ne réassigne pas automatiquement sans décision."
+            ),
+            "data_extra": {
+                "assignee_valid": evidence["assignee_valid"],
+                "compatible_worker_available": evidence["compatible_worker_available"],
+            },
+        }
+
+    # P3 — profile capacity saturated by running workers of the same assignee.
+    if isinstance(cap, int) and cap >= 1 and len(running) >= cap:
+        fresh = [s for s in running if not bool(s.get("stale"))]
+        n = len(running)
+        if fresh:
+            # A healthy running sibling legitimately holds the slot.
+            if evidence["expected_slot_availability"] and not evidence["queue_progression"]:
+                # A slot freed in the window yet nobody claimed this task —
+                # not a legitimate wait even with a sibling currently running.
+                return _unexplained_outcome(evidence, age_seconds, threshold_seconds)
+            if evidence["queue_position"] is not None and evidence["queue_position"] >= 1:
+                return {
+                    "classification": CLASSIFICATION_LEGITIMATELY_QUEUED,
+                    "attention": ATTENTION_INFO,
+                    "banner": False,
+                    "severity": "warning",
+                    "title": "En attente légitime de capacité worker",
+                    "status": (
+                        f"En attente légitime de capacité worker — profile "
+                        f"{assignee} occupé par {fresh[0].get('id') or 'un worker'} "
+                        f"(running), position {evidence['queue_position']}, "
+                        f"priority {evidence['priority']}."
+                    ),
+                    "cause": (
+                        f"Capacité du profile atteinte ({n}/{cap}) ; dispatcher "
+                        f"sain ; la file avance."
+                    ),
+                    "impact": "Aucun — la tâche sera claimée dès qu'un slot se libère.",
+                    "system_action": (
+                        "Le dispatcher claim la tâche au prochain tick disponible."
+                    ),
+                    "data_extra": {
+                        "profile_cap": cap,
+                        "running_siblings": [s.get("id") for s in running],
+                        "queue_position": evidence["queue_position"],
+                        "priority": evidence["priority"],
+                    },
+                }
+            if evidence["queue_progression"]:
+                return {
+                    "classification": CLASSIFICATION_LEGITIMATELY_QUEUED,
+                    "attention": ATTENTION_INFO,
+                    "banner": False,
+                    "severity": "warning",
+                    "title": "En attente légitime de capacité worker",
+                    "status": (
+                        f"En attente légitime de capacité worker — profile "
+                        f"{assignee} occupé par {fresh[0].get('id') or 'un worker'} "
+                        f"(running)."
+                    ),
+                    "cause": (
+                        f"Capacité du profile atteinte ({n}/{cap}) ; dispatcher "
+                        f"sain ; la file avance."
+                    ),
+                    "impact": "Aucun — la tâche sera claimée dès qu'un slot se libère.",
+                    "system_action": (
+                        "Le dispatcher claim la tâche au prochain tick disponible."
+                    ),
+                    "data_extra": {
+                        "profile_cap": cap,
+                        "running_siblings": [s.get("id") for s in running],
+                        "queue_position": evidence["queue_position"],
+                        "priority": evidence["priority"],
+                    },
+                }
+            # Healthy sibling, but no queue-progression / position proof yet:
+            # still an expected wait, informational only.
+            return {
+                "classification": CLASSIFICATION_PROFILE_CAPACITY_SATURATED,
+                "attention": ATTENTION_INFO,
+                "banner": False,
+                "severity": "warning",
+                "title": "Capacité worker saturée — attente normale",
+                "status": (
+                    f"Capacité worker saturée — profile {assignee} : "
+                    f"{n}/{cap} running ; attente normale."
+                ),
+                "cause": (
+                    f"Capacité du profile atteinte ({n}/{cap}) ; un worker actif "
+                    "occupe le slot."
+                ),
+                "impact": "Aucun — la tâche sera claimée dès qu'un slot se libère.",
+                "system_action": (
+                    "Le dispatcher claim la tâche au prochain tick disponible."
+                ),
+                "data_extra": {
+                    "profile_cap": cap,
+                    "running_siblings": [s.get("id") for s in running],
+                },
+            }
+        # No fresh sibling: every running worker of this profile is stale.
+        if isinstance(dispatcher, dict) and dispatcher.get("healthy") is True:
+            # The dispatcher reclaims stale claims on its next tick — expected.
+            return {
+                "classification": CLASSIFICATION_PROFILE_CAPACITY_SATURATED,
+                "attention": ATTENTION_INFO,
+                "banner": False,
+                "severity": "warning",
+                "title": "Capacité worker saturée — attente normale",
+                "status": (
+                    f"Capacité worker saturée — profile {assignee} : "
+                    f"{n}/{cap} running ; attente normale."
+                ),
+                "cause": (
+                    f"Capacité du profile atteinte ({n}/{cap}) par des workers sans "
+                    "heartbeat récent ; le dispatcher les réclame au prochain tick."
+                ),
+                "impact": "Aucun — la tâche sera claimée après réclamation des slots.",
+                "system_action": (
+                    "Le dispatcher réclame les claims expirés/sans heartbeat puis "
+                    "claim cette tâche."
+                ),
+                "data_extra": {
+                    "profile_cap": cap,
+                    "running_siblings": [s.get("id") for s in running],
+                    "stale_siblings": True,
+                },
+            }
+        # Stale siblings + no dispatcher-health proof: abnormal, not proven
+        # auto-recoverable → surface it.
+        return {
+            "classification": CLASSIFICATION_PROFILE_CAPACITY_SATURATED,
+            "attention": ATTENTION_WARNING,
+            "banner": True,
+            "severity": "warning",
+            "title": "Capacité worker saturée par des workers sans heartbeat",
+            "status": (
+                f"Capacité worker saturée par des workers sans heartbeat récent — "
+                f"profile {assignee} : {n}/{cap} running."
+            ),
+            "cause": (
+                f"Les workers running du profile {assignee} n'ont pas de heartbeat "
+                "récent (stale) et rien ne prouve que le dispatcher les réclamera."
+            ),
+            "impact": "Cette tâche reste en file tant que les slots ne sont pas libérés.",
+            "system_action": (
+                "Le dispatcher réclame normalement les claims expirés/sans heartbeat "
+                "au prochain tick."
+            ),
+            "data_extra": {
+                "profile_cap": cap,
+                "running_siblings": [s.get("id") for s in running],
+                "stale_siblings": True,
+            },
+        }
+
+    # P4/P5 — capacity free or unknown: a slot freed and wasn't taken, or
+    # nothing explains the wait. Fail-safe default (conservative):
+    # READY_TOO_LONG_UNEXPLAINED warning, in the attention banner.
+    dispatcher_healthy = (
+        isinstance(dispatcher, dict) and dispatcher.get("healthy") is True
+    )
+    severity = _age_technical_severity(age_seconds, threshold_seconds)
+    if age_seconds >= threshold_seconds * 6:
+        attention = ATTENTION_CRITICAL
+    elif age_seconds >= threshold_seconds * 2:
+        attention = ATTENTION_ACTION_REQUIRED
+    else:
+        attention = ATTENTION_WARNING
+    cause_bits = [
+        f"Assignee {assignee} valide" if evidence["assignee_valid"] is True else
+        "Assignee non vérifiable",
+    ]
+    if dispatcher_healthy:
+        cause_bits.append("dispatcher sain")
+    cause_bits.append("capacité disponible et aucun claim observé dans la fenêtre")
+    if evidence["expected_slot_availability"]:
+        cause_bits.append("un slot s'est libéré sans que la tâche soit prise")
+    cause_bits.append("aucune explication légitime (la file n'avance pas)")
+    return {
+        "classification": CLASSIFICATION_READY_TOO_LONG_UNEXPLAINED,
+        "attention": attention,
+        "banner": attention_banner_policy(attention=attention),
+        "severity": severity,
+        "title": f"Prête depuis {_fmt_age(age_seconds)} — aucun worker ne l'a réclamée",
+        "status": (
+            f"Prête depuis {_fmt_age(age_seconds)} — capacité disponible et aucun "
+            "worker ne l'a réclamée."
+        ),
+        "cause": "; ".join(cause_bits) + ".",
+        "impact": (
+            "La tâche ne progresse pas alors qu'elle pourrait être exécutée."
+        ),
+        "system_action": "Hermes continue de proposer la tâche à chaque tick.",
+        "data_extra": {
+            "expected_slot_availability": evidence["expected_slot_availability"],
+            "queue_position": evidence["queue_position"],
+            "ever_attempted": evidence["ever_attempted"],
+        },
+    }
+
+
 def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Task has been in ``ready`` status for too long without any worker
-    claiming it.
+    claiming it — now a CLASSIFIER, not a bare age signal.
 
     Threshold: cfg["stranded_threshold_seconds"] (default 1800 = 30 min).
 
-    Catches every "task waiting for a worker that never comes" case
-    without caring WHY:
+    The old identity-agnostic rule emitted one undifferentiated "no worker"
+    warning for every aged ready task. That conflated legitimate capacity
+    waits with real problems and produced alarmist copy on healthy queues.
+    The rework classifies each aged ready task into one of five outcomes
+    (Product contract §3) using read-only board/dispatcher evidence:
 
-    * Operator typo'd the assignee — no profile or external worker matches.
-    * Profile was deleted, leaving its tasks stranded.
-    * External worker pool (Codex CLI, Claude Code lane, custom daemon)
-      is down, hung, or wasn't started.
-    * Dispatcher is misconfigured (wrong board, wrong HERMES_HOME).
+      LEGITIMATELY_QUEUED / READY_TOO_LONG_UNEXPLAINED /
+      NO_COMPATIBLE_WORKER / DISPATCHER_UNHEALTHY /
+      PROFILE_CAPACITY_SATURATED
 
-    Pre-rule, all of these silently rotted in ``skipped_nonspawnable`` —
-    the dispatcher correctly skipped them (good — no respawn loop) but
-    nobody surfaced the fact that operator-actionable work was
-    accumulating. The rule fires when a ready task's promoted-to-ready
-    timestamp is older than the threshold AND the assignee is non-empty
-    (truly unassigned tasks have their own ``skipped_unassigned`` signal
-    on the dispatcher and a different operator response).
-
-    The signal is age-based on purpose: it's identity-agnostic, so it
-    works for Hermes profiles, registered lanes, external workers, and
-    typos uniformly. No registry to curate, no per-board allowlist.
+    Fail-safe: when no positive legitimacy evidence exists (low-level calls
+    without board context), the outcome defaults to the conservative
+    READY_TOO_LONG_UNEXPLAINED warning — a missing signal is never dropped
+    for lack of context.
     """
     threshold_seconds = float(
         cfg.get("stranded_threshold_seconds", 30 * 60)
@@ -998,6 +1726,28 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
         # Unassigned tasks: the dispatcher's ``skipped_unassigned`` is
         # already the right signal. A separate diagnostic here would
         # double-flag the same condition.
+        return []
+
+    # Precedence, anti-double-flag (Product §3.3): when repeated failures or
+    # crashes already explain this task, the stranded rule cedes the floor.
+    failure_threshold = _positive_int(cfg.get("failure_threshold"), 3)
+    failures = (
+        _task_field(task, "consecutive_failures", None)
+        if _task_field(task, "consecutive_failures", None) is not None
+        else _task_field(task, "spawn_failures", 0)
+    )
+    if failures is not None and failures >= failure_threshold:
+        return []
+    crash_threshold = int(cfg.get("crash_threshold", 2))
+    ordered_runs = sorted(runs, key=lambda r: _task_field(r, "id", 0) or 0)
+    trailing_crashes = 0
+    for r in reversed(ordered_runs):
+        outcome = _task_field(r, "outcome")
+        if outcome == "crashed":
+            trailing_crashes += 1
+        elif outcome in ("completed", "reclaimed"):
+            break
+    if trailing_crashes >= crash_threshold:
         return []
 
     # Find the most recent event that put this task into ready.
@@ -1025,57 +1775,369 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     if age_seconds < threshold_seconds:
         return []
 
-    # Format the age in the largest sensible unit.
-    if age_seconds >= 3600:
-        age_str = f"{age_seconds / 3600:.1f}h"
-    else:
-        age_str = f"{int(age_seconds / 60)}m"
+    board_context = cfg.get("_board_context")
+    evidence = _stranded_evidence(task, board_context, now)
+    outcome = _classify_ready_outcome(evidence, age_seconds, threshold_seconds)
 
-    # Severity escalates with age. Below 2x threshold = warning;
-    # 2x – 6x = error; beyond 6x = critical (something is clearly
-    # broken, not just slow).
-    if age_seconds >= threshold_seconds * 6:
-        severity = "critical"
-    elif age_seconds >= threshold_seconds * 2:
-        severity = "error"
-    else:
-        severity = "warning"
-
-    actions = [
-        DiagnosticAction(
+    classification = outcome["classification"]
+    attention = outcome["attention"]
+    actions: list[DiagnosticAction] = []
+    if classification == CLASSIFICATION_DISPATCHER_UNHEALTHY:
+        actions.append(_run_diagnostics_action(suggested=True))
+        actions.append(_secondary_cli_hint(
+            "hermes kanban diagnostics",
+            label="Voir la commande CLI",
+        ))
+    elif classification == CLASSIFICATION_NO_COMPATIBLE_WORKER:
+        actions.append(DiagnosticAction(
             kind="reassign",
-            label="Reassign to a different worker",
+            label="Réassigner",
             payload={"current_assignee": assignee},
-        ),
-        DiagnosticAction(
-            kind="cli_hint",
-            label="Check dispatcher status",
-            payload={"command": "hermes kanban diagnostics"},
-        ),
-    ]
+            suggested=True,
+        ))
+        actions.append(_run_diagnostics_action())
+    elif classification == CLASSIFICATION_READY_TOO_LONG_UNEXPLAINED:
+        actions.append(_run_diagnostics_action(suggested=True))
+        actions.append(DiagnosticAction(
+            kind="reassign",
+            label="Réassigner",
+            payload={"current_assignee": assignee},
+        ))
+        actions.append(_secondary_cli_hint(
+            "hermes kanban diagnostics",
+            label="Voir la commande CLI",
+        ))
+    elif classification == CLASSIFICATION_PROFILE_CAPACITY_SATURATED:
+        if attention == ATTENTION_WARNING:
+            actions.append(_run_diagnostics_action(suggested=True))
+            actions.append(_view_worker_action())
+        else:
+            actions.append(_view_queue_action(assignee))
+    else:  # LEGITIMATELY_QUEUED
+        actions.append(_view_queue_action(assignee))
+        actions.append(_view_worker_action())
 
-    return [Diagnostic(
+    task_id = str(_task_field(task, "id") or "")
+    detail = (
+        f"Task {task_id} has been ready for {_fmt_age(age_seconds)} "
+        f"(threshold {int(threshold_seconds)}s). Classification "
+        f"{classification}: ready_since={last_ready_ts}, "
+        f"assignee={assignee!r}, age_seconds={int(age_seconds)}."
+    )
+    data = {
+        "ready_since": last_ready_ts,
+        "age_seconds": int(age_seconds),
+        "assignee": assignee,
+        "threshold_seconds": int(threshold_seconds),
+        "classification": classification,
+    }
+    data.update(outcome.get("data_extra") or {})
+
+    diag = Diagnostic(
         kind="stranded_in_ready",
-        severity=severity,
-        title=f"Ready for {age_str} with no worker",
-        detail=(
-            f"This task has been ready for {age_str} but nothing has "
-            f"claimed it. Common causes: assignee {assignee!r} is "
-            f"misspelled, the profile was deleted, or the external "
-            f"worker pool for this lane is down. Confirm the assignee "
-            f"is correct and that a worker is actually polling for it."
-        ),
+        severity=outcome["severity"],
+        title=outcome["title"],
+        detail=detail,
         actions=actions,
         first_seen_at=last_ready_ts,
         last_seen_at=last_ready_ts,
         count=1,
+        data=data,
+        **_op(
+            attention=attention,
+            system_action=outcome["system_action"],
+            status=outcome["status"],
+            cause=outcome["cause"],
+            impact=outcome["impact"],
+            classification=classification,
+        ),
+    )
+    diag.attention_banner = outcome["banner"]
+    return [diag]
+
+
+def _rule_recovery_lifecycle(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Surface deterministic auto-recovery lifecycle markers (read-only).
+
+    Bounded and NON-OVERLAPPING with the stall-mission watchdog
+    (t_60c940e3 lane): this rule never executes or schedules recovery — it
+    renders states that the dispatcher/watchdog record as events
+    (``recovery_started`` / ``recovering`` / ``recovery_failed`` /
+    ``recovery_succeeded``). Before the merged watchdog emits those markers
+    nothing fires (no fabricated RECOVERING).
+    """
+    state = AUTO_RECOVERY_NONE
+    start_ev = None
+    fail_ev = None
+    for ev in events:
+        k = _event_kind(ev)
+        if k in _RECOVERY_START_KINDS:
+            state = AUTO_RECOVERY_IN_PROGRESS
+            start_ev = ev
+            fail_ev = None
+        elif k == EVENT_RECOVERY_SUCCEEDED:
+            state = AUTO_RECOVERY_SUCCEEDED
+        elif k == EVENT_RECOVERY_FAILED:
+            state = AUTO_RECOVERY_FAILED
+            fail_ev = ev
+
+    task_id = str(_task_field(task, "id") or "")
+    if state == AUTO_RECOVERY_IN_PROGRESS and start_ev is not None:
+        payload = _parse_payload(start_ev)
+        action = str(payload.get("action") or payload.get("kind") or "auto-recovery")
+        ts = _event_ts(start_ev) or now
+        diag = Diagnostic(
+            kind="recovery_in_progress",
+            severity="warning",
+            title="Récupération automatique en cours",
+            detail=(
+                f"Task {task_id}: deterministic auto-recovery {action!r} is "
+                f"in progress (event {_event_kind(start_ev)}). History is kept."
+            ),
+            actions=[_view_worker_action()],
+            first_seen_at=ts,
+            last_seen_at=ts,
+            count=1,
+            data={"action": action, "task_id": task_id},
+            **_op(
+                attention=ATTENTION_INFO,
+                auto_recovery_state=AUTO_RECOVERY_IN_PROGRESS,
+                system_action=(
+                    f"Hermes exécute {action} de façon sûre ; historique conservé."
+                ),
+                status=(
+                    "Récupération automatique en cours — claim stale / worker "
+                    "orphelin détecté."
+                ),
+                cause=(
+                    f"Action {action} déclenchée (claim expiré, pid mort, heartbeat "
+                    "absent)."
+                ),
+                impact="La tâche était bloquée sans worker effectif.",
+            ),
+        )
+        diag.attention_banner = False
+        return [diag]
+    if state == AUTO_RECOVERY_FAILED and fail_ev is not None:
+        payload = _parse_payload(fail_ev)
+        action = str(payload.get("action") or payload.get("kind") or "auto-recovery")
+        board_impact = bool(payload.get("board_impact"))
+        attention = ATTENTION_CRITICAL if board_impact else ATTENTION_ACTION_REQUIRED
+        ts = _event_ts(fail_ev) or now
+        actions = [
+            DiagnosticAction(
+                kind="reclaim",
+                label="Récupérer la tâche",
+                payload={},
+                suggested=True,
+            ),
+            _run_diagnostics_action(),
+        ]
+        diag = Diagnostic(
+            kind="recovery_failed",
+            severity="critical" if board_impact else "error",
+            title="La récupération automatique a échoué",
+            detail=(
+                f"Task {task_id}: deterministic auto-recovery {action!r} failed "
+                f"(event {_event_kind(fail_ev)}). Escalation to the operator."
+            ),
+            actions=actions,
+            first_seen_at=ts,
+            last_seen_at=ts,
+            count=1,
+            data={
+                "action": action,
+                "task_id": task_id,
+                "board_impact": board_impact,
+            },
+            **_op(
+                attention=attention,
+                auto_recovery_state=AUTO_RECOVERY_FAILED,
+                system_action="Aucune — la récupération automatique a échoué ; escalade opérateur.",
+                status=f"La récupération automatique a échoué : {action}.",
+                cause=(
+                    "La récupération déterministe n'a pas abouti (échec ou décision "
+                    "matérielle requise)."
+                ),
+                impact=(
+                    "Impact board — plusieurs tâches/files peuvent être affectées."
+                    if board_impact else
+                    "Cette tâche reste bloquée sans worker effectif."
+                ),
+            ),
+        )
+        diag.attention_banner = True
+        return [diag]
+    return []
+
+
+def _rule_duplicate_implementation(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Two or more active tasks/workers on the same repo+branch+scope.
+
+    Read-only detection driven by board-context evidence (``active_scope_tasks``
+    + ``superseded_scope_tasks``). AUTO consolidation only on PROVEN
+    supersession; otherwise the owner decides which card continues.
+    """
+    if _task_field(task, "status") not in ("running", "ready"):
+        return []
+    board_context = cfg.get("_board_context")
+    if not isinstance(board_context, dict):
+        return []
+    active = board_context.get("active_scope_tasks")
+    if not isinstance(active, list) or not active:
+        return []
+    my_key = _task_scope_key(task)
+    if my_key is None:
+        return []
+    task_id = str(_task_field(task, "id") or "")
+    superseded = board_context.get("superseded_scope_tasks") or []
+    superseded_me = task_id in superseded
+    assignee = str(_task_field(task, "assignee") or "").strip()
+
+    others: list[dict] = []
+    for other in active:
+        if str(other.get("id") or "") == task_id:
+            continue
+        if other.get("status") not in ("running", "ready"):
+            continue
+        if _task_scope_key(other) == my_key:
+            others.append(other)
+    if not others:
+        return []
+
+    other_ids = sorted({str(o.get("id") or "") for o in others})
+    ws = str(_task_field(task, "workspace_path") or "")
+    branch = str(_task_field(task, "branch_name") or "")
+    project = str(_task_field(task, "project_id") or "")
+    scope_desc = " + ".join(
+        part for part in (ws or None, branch or None, project or None) if part
+    )
+    attention = (
+        ATTENTION_WARNING if superseded_me else ATTENTION_ACTION_REQUIRED
+    )
+    banner = False if superseded_me else True
+    actions = [_view_queue_action(assignee) if assignee else _run_diagnostics_action()]
+    if not superseded_me:
+        actions.append(DiagnosticAction(
+            kind="reassign",
+            label="Réassigner",
+            payload={"current_assignee": assignee},
+        ))
+    diag = Diagnostic(
+        kind="duplicate_implementation",
+        severity="warning",
+        title=(
+            "Implémentation dupliquée — supersession prouvée (consolidation auto)"
+            if superseded_me else
+            "Implémentation dupliquée potentielle"
+        ),
+        detail=(
+            f"{len(others)} other active task(s) share the same repo+branch+scope "
+            f"({scope_desc or 'unknown'}): {', '.join(other_ids)}."
+            + (" This card is proven superseded; auto-consolidation applies."
+               if superseded_me else "")
+        ),
+        actions=actions,
+        first_seen_at=now,
+        last_seen_at=now,
+        count=len(others),
         data={
-            "ready_since": last_ready_ts,
-            "age_seconds": int(age_seconds),
-            "assignee": assignee,
-            "threshold_seconds": int(threshold_seconds),
+            "other_task_ids": other_ids,
+            "scope": scope_desc,
+            "repo": ws,
+            "branch": branch,
+            "project_id": project,
+            "superseded": superseded_me,
         },
-    )]
+        **_op(
+            attention=attention,
+            system_action=(
+                "Consolidation automatique prévue (supersession prouvée)."
+                if superseded_me else
+                "Aucune consolidation automatique sans supersession prouvée."
+            ),
+            status=(
+                "Implémentation dupliquée — supersession prouvée."
+                if superseded_me else
+                "Implémentation dupliquée potentielle — même repo+branch+scope."
+            ),
+            cause=(
+                f"{len(others)} tâche(s)/worker(s) actif(s) sur le même périmètre "
+                f"({', '.join(other_ids)})."
+            ),
+            impact="",
+            risk="Double implémentation / conflit au merge.",
+        ),
+    )
+    diag.attention_banner = banner
+    return [diag]
+
+
+def _rule_concurrent_writer_risk(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """An out-of-band (non-kanban) worker is writing to the same checkout.
+
+    Read-only: evidence arrives via board context (``out_of_band_writers``),
+    typically from an observer watching non-kanban processes on the checkout.
+    Hermes never touches the checkout; the owner arbitrates.
+    """
+    if _task_field(task, "status") not in ("running", "ready"):
+        return []
+    board_context = cfg.get("_board_context")
+    if not isinstance(board_context, dict):
+        return []
+    writers = board_context.get("out_of_band_writers")
+    if not isinstance(writers, list) or not writers:
+        return []
+    checkout = str(_task_field(task, "workspace_path") or "").strip()
+    if not checkout:
+        return []
+    task_id = str(_task_field(task, "id") or "")
+
+    matching = [
+        w for w in writers
+        if str((w or {}).get("checkout") or "").strip() == checkout
+    ]
+    if not matching:
+        return []
+    sources = sorted({str(w.get("source") or "unknown") for w in matching})
+    diag = Diagnostic(
+        kind="concurrent_writer_risk",
+        severity="error",
+        title="Worker hors-band détecté sur le même checkout",
+        detail=(
+            f"Task {task_id}: {len(matching)} out-of-band writer(s) observed on "
+            f"checkout {checkout!r} ({', '.join(sources)})."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="comment",
+                label="Ajouter un commentaire (arbitrage)",
+                payload={},
+                suggested=True,
+            ),
+            _run_diagnostics_action(),
+        ],
+        first_seen_at=now,
+        last_seen_at=now,
+        count=len(matching),
+        data={
+            "checkout": checkout,
+            "sources": sources,
+            "task_id": task_id,
+        },
+        **_op(
+            attention=ATTENTION_ACTION_REQUIRED,
+            system_action="Hermes surveille le checkout ; ne modifie rien.",
+            status="Worker hors-band détecté sur le même checkout.",
+            cause=(
+                "Un worker non-kanban (out-of-band) écrit sur ce checkout."
+            ),
+            impact="",
+            risk="Écritures concurrentes → perte/écrasement.",
+        ),
+    )
+    diag.attention_banner = True
+    return [diag]
 
 
 # Registry — order matters: rules higher on the list render first when
@@ -1090,6 +2152,9 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_recovery_lifecycle,
+    _rule_duplicate_implementation,
+    _rule_concurrent_writer_risk,
 ]
 
 
@@ -1105,7 +2170,90 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "recovery_in_progress",
+    "recovery_failed",
+    "duplicate_implementation",
+    "concurrent_writer_risk",
 )
+
+
+# Operator-axis defaults per kind (audit matrix, Product contract §4). Rules
+# that need outcome-specific values set them explicitly at construction time;
+# the finalizer applies these for the legacy rules that predate the axis.
+_KIND_OPERATOR_META: dict[str, dict] = {
+    "hallucinated_cards": {
+        "attention": ATTENTION_ACTION_REQUIRED,
+        "abnormal": True,
+        "auto_recoverable": False,
+        "system_action": "Aucune — le kernel ne devine pas la route des created_cards fantômes.",
+        "status": "Terminaison bloquée : created_cards fantômes déclarés par le worker.",
+        "cause": "Le worker a déclaré des id qui n'existent pas ou n'ont pas été créés par son profile.",
+        "impact": "La tâche reste dans son état précédent ; les dépendants ne sont pas libérés.",
+    },
+    "triage_aux_unavailable": {
+        "attention": ATTENTION_ACTION_REQUIRED,
+        "abnormal": True,
+        "auto_recoverable": False,
+        "system_action": "Aucune — le dispatcher ne peut pas spécifier/décomposer sans modèle auxiliaire.",
+        "status": "Triage bloqué : aucun modèle auxiliaire utilisable.",
+        "cause": "Le slot auxiliaire requis n'est pas configuré et aucun modèle principal ne sert de fallback.",
+        "impact": "La tâche ne peut pas quitter triage.",
+    },
+    "prose_phantom_refs": {
+        "attention": ATTENTION_INFO,
+        "abnormal": False,
+        "auto_recoverable": True,
+        "system_action": "Auto-clear à la prochaine completion propre.",
+        "status": "Terminaison OK ; le résumé référence des task ids inconnus.",
+        "cause": "La completion mentionne des id qui ne résolvent pas dans la base du board.",
+        "impact": "Aucun — diagnostic informatif.",
+    },
+    "repeated_failures": {
+        "attention": ATTENTION_ACTION_REQUIRED,
+        "abnormal": True,
+        "auto_recoverable": False,
+        "system_action": "Le dispatcher retente puis bloque automatiquement après le failure limit.",
+        "status": "Échecs répétés — la tâche ne parvient pas à s'exécuter.",
+        "cause": "Chaque tentative échoue de la même façon (spawn/timeout/crash).",
+        "impact": "La tâche ne progresse pas ; le circuit breaker finira par la bloquer.",
+    },
+    "repeated_crashes": {
+        "attention": ATTENTION_ACTION_REQUIRED,
+        "abnormal": True,
+        "auto_recoverable": False,
+        "system_action": "Le dispatcher retente jusqu'au circuit breaker.",
+        "status": "Le worker crashe de façon répétée.",
+        "cause": "Les dernières runs se terminent par outcome=crashed.",
+        "impact": "La tâche ne progresse pas sans correction de la cause racine.",
+    },
+    "review_dependency_deadlock": {
+        "attention": ATTENTION_ACTION_REQUIRED,
+        "abnormal": True,
+        "auto_recoverable": False,
+        "system_action": "Aucune — graphe de dépendances et sticky block préservés par conception.",
+        "status": "Workflow bloqué : le sticky-block review-required retient des dépendants.",
+        "cause": "Un bloc review-required legacy garde des enfants en todo.",
+        "impact": "La lane aval ne peut pas démarrer.",
+    },
+    "stuck_in_blocked": {
+        "attention": ATTENTION_ACTION_REQUIRED,
+        "abnormal": True,
+        "auto_recoverable": False,
+        "system_action": "Aucune — une tâche bloquée attend une décision humaine.",
+        "status": "Tâche bloquée sans échange récent.",
+        "cause": "Aucun commentaire ni tentative d'unblock depuis le passage en blocked.",
+        "impact": "La suite du workflow est suspendue.",
+    },
+    "block_unblock_cycling": {
+        "attention": ATTENTION_ACTION_REQUIRED,
+        "abnormal": True,
+        "auto_recoverable": False,
+        "system_action": "Aucune — l'unblock seul ne traite pas la cause racine.",
+        "status": "Cycles block→unblock répétés sur cette tâche.",
+        "cause": "La tâche est re-bloquée pour sensiblement la même raison après chaque unblock.",
+        "impact": "Le workflow oscille sans avancer ; risque de boucle.",
+    },
+}
 
 
 DEFAULT_CONFIG = {
@@ -1168,6 +2316,50 @@ def config_from_runtime_config(raw_config: Optional[dict]) -> dict:
     return cfg
 
 
+def _finalize_operator_fields(diag: Diagnostic) -> None:
+    """Fill/validate the operator-attention axis on every emitted diagnostic.
+
+    * ``attention`` — per-kind matrix default when the rule left the default
+      INFO (legacy rules); explicit rule values win.
+    * ``owner_action`` — always derived from attention (REQUIRED only for
+      ACTION_REQUIRED/CRITICAL).
+    * ``attention_banner`` — resolved by :func:`attention_banner_policy` when
+      the rule did not pin it.
+    * FR operator message fallbacks from the matrix for legacy kinds.
+    """
+    meta = _KIND_OPERATOR_META.get(diag.kind, {})
+    if diag.attention == ATTENTION_INFO and meta.get("attention", ATTENTION_INFO) != ATTENTION_INFO:
+        diag.attention = meta["attention"]
+    # Escalation: unified failure/crash rules that hit CRITICAL technical
+    # severity also demand CRITICAL operator attention.
+    if (
+        diag.kind in ("repeated_failures", "repeated_crashes")
+        and diag.severity == "critical"
+        and diag.attention == ATTENTION_ACTION_REQUIRED
+    ):
+        diag.attention = ATTENTION_CRITICAL
+    if diag.attention not in ATTENTION_ORDER:
+        diag.attention = ATTENTION_INFO
+    diag.owner_action = owner_action_for_attention(diag.attention)
+    if diag.auto_recovery_state not in AUTO_RECOVERY_STATES:
+        diag.auto_recovery_state = AUTO_RECOVERY_NONE
+    if diag.attention_banner is None:
+        diag.attention_banner = attention_banner_policy(
+            attention=diag.attention,
+            auto_recovery_state=diag.auto_recovery_state,
+            abnormal=bool(meta.get("abnormal", True)),
+            auto_recoverable=bool(meta.get("auto_recoverable", False)),
+        )
+    if not diag.system_action:
+        diag.system_action = meta.get("system_action", "")
+    if not diag.operator_status:
+        diag.operator_status = meta.get("status", "")
+    if not diag.operator_cause:
+        diag.operator_cause = meta.get("cause", "")
+    if not diag.operator_impact:
+        diag.operator_impact = meta.get("impact", "")
+
+
 def compute_task_diagnostics(
     task,
     events: list,
@@ -1176,9 +2368,16 @@ def compute_task_diagnostics(
     now: Optional[int] = None,
     config: Optional[dict] = None,
     graph: Optional[dict] = None,
+    board_context: Optional[dict] = None,
 ) -> list[Diagnostic]:
     """Run every rule against a single task's state and return a
     severity-sorted list of active diagnostics.
+
+    ``board_context`` carries the read-only board/dispatcher evidence the
+    classifier needs (dispatcher health, profile roster/cap, running
+    siblings, queue progression, concurrency). Every key is optional;
+    absent evidence never counts as health (fail-safe). Build it with
+    :func:`build_board_context` or pass it by hand (tests / Mission Control).
 
     Sorting: critical first, then error, then warning; ties broken by
     most-recent ``last_seen_at``.
@@ -1188,6 +2387,8 @@ def compute_task_diagnostics(
     cfg = {**DEFAULT_CONFIG, **config}
     if graph is not None:
         cfg["_graph"] = graph
+    if board_context is not None:
+        cfg["_board_context"] = board_context
     if (
         "failure_threshold" not in config
         and "spawn_failure_threshold" not in config
@@ -1206,11 +2407,190 @@ def compute_task_diagnostics(
             # get caught in tests; in production we'd rather drop the
             # diagnostic than 500 a whole /board request.
             continue
+    for diag in out:
+        _finalize_operator_fields(diag)
     severity_idx = {s: i for i, s in enumerate(SEVERITY_ORDER)}
+    attention_idx = {a: i for i, a in enumerate(ATTENTION_ORDER)}
     out.sort(
         key=lambda d: (
             -severity_idx.get(d.severity, -1),
+            -attention_idx.get(d.attention, 0),
             -(d.last_seen_at or 0),
         )
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Read-only board context collector
+#
+# Classification decision inputs (Product contract §3) are gathered here from
+# STABLE columns at the f1a98f7662 base — no schema change, kanban_db read
+# APIs / read-only SELECTs only. Any input the collector cannot observe stays
+# None; the classifier treats missing evidence as unknown, never as health.
+# ---------------------------------------------------------------------------
+
+
+def build_board_context(
+    conn=None,
+    *,
+    config: Optional[dict] = None,
+    now: Optional[int] = None,
+) -> dict:
+    """Collect read-only board/dispatcher evidence for the classifier.
+
+    ``conn`` is an optional kanban sqlite3 connection (kanban_db.connect());
+    when omitted the collector returns only what config alone can provide
+    (profile caps) — safe for low-level callers.
+
+    ``config`` is the diagnostics config dict (see config_from_runtime_config);
+    its ``kanban`` subsection supplies ``max_in_progress`` /
+    ``max_in_progress_per_profile`` when present.
+
+    Returns the evidence dict consumed by :func:`compute_task_diagnostics`
+    via its ``board_context`` argument. Dispatcher health and out-of-band
+    writers are intentionally NOT derived here (no reliable read-only source
+    at the base): callers with live dispatcher telemetry pass them explicitly.
+    """
+    now_ts = int(now if now is not None else time.time())
+    ctx: dict = {
+        "dispatcher": None,
+        "profiles": None,
+        "lanes": None,
+        "profile_cap": None,
+        "board_cap": None,
+        "running_by_assignee": {},
+        "queue_by_assignee": {},
+        "queue_progressed_by_assignee": {},
+        "expected_slot_freed_by_assignee": {},
+        "attempts_by_task": {},
+        "active_scope_tasks": [],
+        "out_of_band_writers": None,
+        "superseded_scope_tasks": [],
+    }
+
+    # --- config-derived caps (no DB) ---
+    kanban_cfg = config.get("kanban") if isinstance(config, dict) else None
+    if isinstance(kanban_cfg, dict):
+        raw_per_profile = kanban_cfg.get("max_in_progress_per_profile")
+        if isinstance(raw_per_profile, int) and raw_per_profile > 0:
+            ctx["profile_cap"] = raw_per_profile
+        raw_board = kanban_cfg.get("max_in_progress")
+        if isinstance(raw_board, int) and raw_board > 0:
+            ctx["board_cap"] = raw_board
+
+    if conn is None:
+        return ctx
+
+    try:
+        from hermes_cli import kanban_db as kb
+    except Exception:
+        return ctx
+
+    # --- profile roster (Hermes profiles on disk; positive validity proof) ---
+    try:
+        profiles = kb.list_profiles_on_disk()
+        ctx["profiles"] = [str(p) for p in profiles] if profiles else []
+    except Exception:
+        ctx["profiles"] = None
+
+    # --- running siblings + ready queue per assignee (stable columns) ---
+    heartbeat_max_stale = kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+    claim_ttl = kb.DEFAULT_CLAIM_TTL_SECONDS
+    running_map: dict[str, list[dict]] = {}
+    queue_map: dict[str, list[dict]] = {}
+    try:
+        rows = conn.execute(
+            "SELECT id, status, assignee, priority, claim_lock, claim_expires, worker_pid, "
+            "       last_heartbeat_at, started_at "
+            "FROM tasks WHERE status IN ('running', 'ready') AND assignee IS NOT NULL"
+        ).fetchall()
+        for r in rows:
+            assignee = r["assignee"]
+            if r["status"] == "running":
+                hb = r["last_heartbeat_at"]
+                started = r["started_at"]
+                stale = False
+                if hb:
+                    stale = (now_ts - int(hb)) > heartbeat_max_stale
+                elif started:
+                    stale = (now_ts - int(started)) > claim_ttl
+                running_map.setdefault(assignee, []).append({
+                    "id": r["id"],
+                    "stale": stale,
+                    "started_at": r["started_at"],
+                    "last_heartbeat_at": hb,
+                    "worker_pid": r["worker_pid"],
+                })
+            else:  # ready — dispatch order is priority DESC then id ASC
+                queue_map.setdefault(assignee, []).append({
+                    "id": r["id"],
+                    "priority": r["priority"] or 0,
+                })
+    except Exception:
+        pass
+    ctx["running_by_assignee"] = running_map
+    ctx["queue_by_assignee"] = queue_map
+
+    # --- queue progression + freed-slot signals per assignee (event evidence
+    # within a bounded window) ---
+    window = max(claim_ttl * 2, 2 * 60)
+    cutoff = now_ts - window
+    progressed_map: dict[str, bool] = {}
+    freed_map: dict[str, bool] = {}
+    try:
+        progressed_rows = conn.execute(
+            "SELECT DISTINCT t.assignee AS a FROM task_events e "
+            "JOIN tasks t ON t.id = e.task_id "
+            "WHERE e.kind IN ('claimed', 'spawned') AND e.created_at >= ? "
+            "AND t.assignee IS NOT NULL",
+            (cutoff,),
+        ).fetchall()
+        for r in progressed_rows:
+            progressed_map[r["a"]] = True
+        freed_rows = conn.execute(
+            "SELECT DISTINCT t.assignee AS a FROM task_events e "
+            "JOIN tasks t ON t.id = e.task_id "
+            "WHERE e.kind IN ('completed', 'reclaimed', 'crashed', 'timed_out') "
+            "AND e.created_at >= ? AND t.assignee IS NOT NULL",
+            (cutoff,),
+        ).fetchall()
+        for r in freed_rows:
+            freed_map[r["a"]] = True
+    except Exception:
+        pass
+    ctx["queue_progressed_by_assignee"] = progressed_map
+    ctx["expected_slot_freed_by_assignee"] = freed_map
+
+    # --- ever-attempted per task (historical runs) ---
+    attempts: dict[str, int] = {}
+    try:
+        for r in conn.execute(
+            "SELECT task_id, COUNT(*) AS n FROM task_runs GROUP BY task_id"
+        ).fetchall():
+            attempts[r["task_id"]] = int(r["n"])
+    except Exception:
+        pass
+    ctx["attempts_by_task"] = attempts
+
+    # --- active same-scope tasks (repo+branch+scope concurrency detection) ---
+    try:
+        active = conn.execute(
+            "SELECT id, status, assignee, workspace_path, branch_name, project_id "
+            "FROM tasks WHERE status IN ('running', 'ready')"
+        ).fetchall()
+        ctx["active_scope_tasks"] = [
+            {
+                "id": r["id"],
+                "status": r["status"],
+                "assignee": r["assignee"],
+                "workspace_path": r["workspace_path"],
+                "branch_name": r["branch_name"],
+                "project_id": r["project_id"],
+            }
+            for r in active
+        ]
+    except Exception:
+        ctx["active_scope_tasks"] = []
+
+    return ctx

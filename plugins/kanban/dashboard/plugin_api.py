@@ -262,13 +262,17 @@ def _compute_task_diagnostics(
 
     diag_config = kd.config_from_runtime_config(load_config())
 
+    # Read-only board/dispatcher evidence for the classifier (stranded
+    # outcomes + concurrency). Missing evidence is never treated as health.
+    board_context = kd.build_board_context(conn, config=diag_config)
+
     # Build the candidate task list. We need each task's row + its
     # events + its runs. Doing N separate queries works but scales
     # poorly; do three aggregate queries instead.
     if task_ids is not None:
         if not task_ids:
             return {}
-        placeholders = ",".join(["?"] * len(task_ids))
+        placeholders = ", ".join(["?"] * len(task_ids))
         rows = conn.execute(
             f"SELECT * FROM tasks WHERE id IN ({placeholders})",
             tuple(task_ids),
@@ -286,7 +290,7 @@ def _compute_task_diagnostics(
     # (hundreds of tasks), but we can add pagination / filtering later
     # if profiling shows it's a hotspot.
     row_ids = [r["id"] for r in rows]
-    placeholders = ",".join(["?"] * len(row_ids))
+    placeholders = ", ".join(["?"] * len(row_ids))
     events_by_task: dict[str, list] = {tid: [] for tid in row_ids}
     for ev_row in conn.execute(
         f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
@@ -310,6 +314,7 @@ def _compute_task_diagnostics(
             runs_by_task.get(tid, []),
             config=diag_config,
             graph=graph_by_task.get(tid),
+            board_context=board_context,
         )
         if diags:
             out[tid] = [d.to_dict() for d in diags]
@@ -324,16 +329,25 @@ def _warnings_summary_from_diagnostics(
     — same shape additions plus ``highest_severity`` so the UI can color
     badges per diagnostic severity.
 
+    Operator Diagnostics Clarity additions (additive, non-breaking):
+    ``highest_attention`` (NONE/INFO/WARNING/ACTION_REQUIRED/CRITICAL) and
+    ``banner_count`` (number of diagnostics whose engine-decided
+    ``attention_banner`` is true) so board surfaces can render the operator
+    attention banner without re-deriving the policy.
+
     Returns None when ``diagnostics`` is empty.
     """
     if not diagnostics:
         return None
-    from hermes_cli.kanban_diagnostics import SEVERITY_ORDER
+    from hermes_cli.kanban_diagnostics import ATTENTION_ORDER, SEVERITY_ORDER
 
     kinds: dict[str, int] = {}
     latest = 0
     highest_idx = -1
     highest_sev: Optional[str] = None
+    attention_idx = -1
+    highest_attention: Optional[str] = None
+    banner_count = 0
     count = 0
     for d in diagnostics:
         kinds[d["kind"]] = kinds.get(d["kind"], 0) + d.get("count", 1)
@@ -347,11 +361,21 @@ def _warnings_summary_from_diagnostics(
             if idx > highest_idx:
                 highest_idx = idx
                 highest_sev = sev
+        attn = d.get("attention")
+        if attn in ATTENTION_ORDER:
+            a_idx = ATTENTION_ORDER.index(attn)
+            if a_idx > attention_idx:
+                attention_idx = a_idx
+                highest_attention = attn
+        if d.get("attention_banner"):
+            banner_count += 1
     return {
         "count": count,
         "kinds": kinds,
         "latest_at": latest,
         "highest_severity": highest_sev,
+        "highest_attention": highest_attention,
+        "banner_count": banner_count,
     }
 
 
