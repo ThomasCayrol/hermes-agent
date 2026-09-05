@@ -267,6 +267,7 @@ class GatewayKanbanWatchersMixin:
             "completed", "blocked", "gave_up", "crashed", "timed_out",
             "stale", "auto_recovery", "status", "archived", "unblocked",
             "block_loop_detected", "review_requested", "changes_requested",
+            "external_ci_wait",
         )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
@@ -713,6 +714,28 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
                                 f" — needs a human decision{rc}{reason}"
+                            )
+                        elif kind == "external_ci_wait":
+                            # External-CI wait watchdog alert (see
+                            # hermes_cli/kanban_external_ci.py). The payload is
+                            # the 10-field operator alert; the state value
+                            # (CI_WAITING_LONG / CI_INFRA_STALLED / …) stays
+                            # internal. This is an external-dependency status,
+                            # NEVER a Hermes worker stall — no reclaim/failure
+                            # vocabulary belongs in the operator copy.
+                            payload = ev.payload or {}
+                            ci_state = payload.get("ciState") or payload.get(
+                                "externalDependencyStatus"
+                            ) or "CI_WAITING"
+                            summary = payload.get("summary") or ""
+                            if summary:
+                                first = summary.strip().splitlines()[0][:200]
+                                text = f" — {first}"
+                            else:
+                                text = ""
+                            msg = (
+                                f"⚠ {board_tag}{tag}Kanban {sub['task_id']} "
+                                f"CI externe ({ci_state}){text}"
                             )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS

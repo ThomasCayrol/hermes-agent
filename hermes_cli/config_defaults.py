@@ -2970,6 +2970,26 @@ DEFAULT_CONFIG = {
         # so stale rows don't accumulate and get scanned on every notifier
         # tick forever. Set 0 to disable the sweep.
         "done_sub_retention_days": 30,
+        # External-CI wait watchdog (see hermes_cli/kanban_external_ci.py).
+        # Classifies GitHub Actions waits on required checks from REAL
+        # evidence (job queued + steps=0 + still required + no superseding +
+        # no completed failure) — never from elapsed time alone. Elapsed
+        # queue time is the evaluation gate; thresholds below decide when a
+        # wait becomes operator-visible.
+        #   warning_minutes     -> CI_WAITING_LONG (>= threshold)
+        #   stall_minutes       -> CI_INFRA_STALLED (>= threshold)
+        #   retry_window_minutes-> bounded observation window after an AUTO
+        #                          job-level rerun
+        # mission_overrides is an optional map keyed by UMBRELLA TASK ID
+        # (never a title); a partial override inherits the other values from
+        # the defaults above. Invalid values fall back to defaults — config
+        # is advisory, never load-bearing for safety.
+        "ci_wait": {
+            "warning_minutes": 45,
+            "stall_minutes": 60,
+            "retry_window_minutes": 30,
+            "mission_overrides": {},
+        },
         # Bounded watchdog window for a terminal handoff persisted as
         # STARTING: the handoff is transitional, never resting. If no real
         # execution witness (same-mission running run / fresh heartbeat)
