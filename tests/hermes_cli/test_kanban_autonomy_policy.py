@@ -91,17 +91,20 @@ def _newest_handoff(conn, task_id) -> dict:
     return events[-1]
 
 
-def _executor_witness(conn):
-    """Claim a real executor card -> execution witness.
+def _executor_witness(conn, mission_task_id, *, action_type="REMEDIATION"):
+    """Claim a same-mission executor and persist its action relation.
 
     AUTO continuations are only persisted when the caller supplies a REAL
     materialization record: the task_runs row an executor's claim created.
-    The card is deliberately NOT linked under the mission umbrella so the
-    in-flight executor does not show up as an active mission worker.
-    Returns ``{"source": "task_run", "run_id": ...}`` referencing that row.
+    Both the task link under the mission and the execution_witness event bind
+    the run to the target mission/action. Returns
+    ``{"source": "task_run", "run_id": ...}`` referencing that row.
     """
     child = kb.create_task(
-        conn, title="Auto executor", assignee="tester",
+        conn,
+        title="Auto executor",
+        assignee="tester",
+        parents=[mission_task_id],
     )
     claimed = kb.claim_task(conn, child, claimer="test")
     if claimed is None:
@@ -109,7 +112,22 @@ def _executor_witness(conn):
         assert ok, why
         claimed = kb.claim_task(conn, child, claimer="test")
     assert claimed is not None and claimed.current_run_id is not None
-    return {"source": "task_run", "run_id": int(claimed.current_run_id)}
+    run_id = int(claimed.current_run_id)
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn,
+            child,
+            kb.EXECUTION_WITNESS_EVENT_KIND,
+            {
+                "source": "task_run",
+                "run_id": run_id,
+                "task_id": child,
+                "mission_task_id": mission_task_id,
+                "actionType": action_type,
+            },
+            run_id=run_id,
+        )
+    return {"source": "task_run", "run_id": run_id}
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +576,7 @@ def test_handoff_rejected_gate_records_auto_remediation_and_continue(conn):
     assert gate_task is not None
     assert kb.emit_terminal_handoff(
         conn, gate_task,
-        execution_witness=_executor_witness(conn),
+        execution_witness=_executor_witness(conn, umbrella),
     ) is True
 
     comments = _handoff_comments(conn, umbrella)
@@ -661,7 +679,7 @@ def test_k_restart_replay_does_not_duplicate_auto_launch(conn):
     assert gate_task is not None
     assert kb.emit_terminal_handoff(
         conn, gate_task,
-        execution_witness=_executor_witness(conn),
+        execution_witness=_executor_witness(conn, umbrella),
     ) is True
     assert len(_events(conn, umbrella, kb.HANDOFF_EVENT_KIND)) == 1
     assert len(_events(conn, umbrella, kb.AUTO_CONTINUE_EVENT_KIND)) == 1
@@ -690,7 +708,7 @@ def test_l_same_next_action_idempotent_across_gateway_restart(conn):
         assert gate_task1 is not None
         assert kb.emit_terminal_handoff(
             conn1, gate_task1,
-            execution_witness=_executor_witness(conn1),
+            execution_witness=_executor_witness(conn1, umbrella),
         ) is True
     with kb.connect() as conn2:
         # Second gateway generation sees no due gates and no new emission.

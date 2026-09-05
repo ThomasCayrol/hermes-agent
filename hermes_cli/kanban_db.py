@@ -5475,13 +5475,67 @@ def repo_state_for(task: Optional[Task]) -> dict:
         return {}
 
 
+def _mission_descendant_rows(
+    conn: sqlite3.Connection, umbrella_id: str,
+) -> list[sqlite3.Row]:
+    """Return every task/run row below the mission umbrella, at any depth.
+
+    Each task contributes one row per ``task_runs`` row plus a synthetic row
+    (``run_id`` NULL) when the task has no runs, so the caller can reconcile
+    every run — including orphan/non-current/multiple live runs — against the
+    task's current pointer.
+    """
+    return conn.execute(
+        "WITH RECURSIVE mission_tasks(id) AS ("
+        "  SELECT child_id FROM task_links WHERE parent_id = ? "
+        "  UNION "
+        "  SELECT l.child_id FROM task_links l "
+        "  JOIN mission_tasks m ON l.parent_id = m.id"
+        ") "
+        "SELECT t.id, t.assignee, t.status, t.current_run_id, "
+        "r.id AS run_id, r.status AS run_status, "
+        "r.ended_at AS run_ended_at, r.claim_expires AS run_claim_expires "
+        "FROM mission_tasks m JOIN tasks t ON t.id = m.id "
+        "LEFT JOIN task_runs r ON r.task_id = t.id "
+        "UNION ALL "
+        "SELECT t.id, t.assignee, t.status, t.current_run_id, "
+        "NULL AS run_id, NULL AS run_status, "
+        "NULL AS run_ended_at, NULL AS run_claim_expires "
+        "FROM mission_tasks m JOIN tasks t ON t.id = m.id "
+        "WHERE NOT EXISTS ("
+        "  SELECT 1 FROM task_runs r WHERE r.task_id = t.id"
+        ") "
+        "ORDER BY 1, 5",
+        (umbrella_id,),
+    ).fetchall()
+
+
+def _run_has_mission_witness(
+    conn: sqlite3.Connection,
+    run_id: int,
+    task_id: str,
+    mission_task_id: str,
+) -> bool:
+    """Return True when a persisted execution-witness event binds the run to
+    the mission (machine-readable mission/action relation)."""
+    return conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+        "AND run_id = ? AND payload LIKE ? LIMIT 1",
+        (
+            task_id,
+            EXECUTION_WITNESS_EVENT_KIND,
+            run_id,
+            f'%"{mission_task_id}"%',
+        ),
+    ).fetchone() is not None
+
+
 def synthesize_terminal_handoff(
     conn: sqlite3.Connection, gate: Task, umbrella: Optional[Task],
 ) -> dict:
     """Synthesize the terminal mission snapshot (no writes)."""
     verdict = gate_verdict(conn, gate)
     repo = repo_state_for(gate) or repo_state_for(umbrella)
-    # Active workers: any running task whose parent chain includes umbrella.
     active: list[str] = []
     running_evidence: list[dict] = []
     if umbrella is not None:
@@ -5497,7 +5551,6 @@ def synthesize_terminal_handoff(
                 (row["id"], umbrella.id),
             ).fetchone()
             if linked:
-                active.append(f"{row['id']} ({row['assignee'] or 'unassigned'})")
                 heartbeat = (
                     int(row["last_heartbeat_at"])
                     if row["last_heartbeat_at"] is not None
@@ -5534,25 +5587,80 @@ def synthesize_terminal_handoff(
                         "currentTask": row["id"],
                     })
     blockers: list[str] = []
+    pending: list[str] = []
+    state_conflicts: list[str] = []
     if umbrella is not None:
-        for row in conn.execute(
-            "SELECT id FROM tasks WHERE status = 'blocked' AND id != ?",
-            (umbrella.id,),
-        ).fetchall():
-            if conn.execute(
-                "SELECT 1 FROM task_links WHERE child_id = ? AND parent_id = ?",
-                (row["id"], umbrella.id),
-            ).fetchone():
-                blockers.append(row["id"])
+        now = int(time.time())
+        task_rows: dict[str, list[sqlite3.Row]] = {}
+        for row in _mission_descendant_rows(conn, umbrella.id):
+            task_rows.setdefault(row["id"], []).append(row)
+        for task_id, rows in task_rows.items():
+            task_row = rows[0]
+            runs = [row for row in rows if row["run_id"] is not None]
+            current_run_id = task_row["current_run_id"]
+            current_runs = [
+                row for row in runs if row["run_id"] == current_run_id
+            ]
+            running_runs = [
+                row for row in runs
+                if row["run_status"] == "running"
+                and row["run_ended_at"] is None
+            ]
+            live_runs = [
+                row for row in running_runs
+                if row["run_claim_expires"] is None
+                or int(row["run_claim_expires"]) > now
+            ]
+            # A live run that IS the materialization of this mission's next
+            # action (execution-witness bound) is already in flight: it is not
+            # an additional worker to wait on.
+            witness_bound_run_ids = {
+                row["run_id"] for row in live_runs
+                if _run_has_mission_witness(
+                    conn, int(row["run_id"]), task_id, umbrella.id,
+                )
+            }
+
+            conflict: Optional[str] = None
+            if current_run_id is not None and len(current_runs) != 1:
+                conflict = "current_run_id does not identify this task's run"
+            elif len(live_runs) > 1:
+                conflict = "multiple live runs"
+            elif len(running_runs) != len(live_runs):
+                conflict = "stale running run"
+            elif live_runs and live_runs[0]["run_id"] != current_run_id:
+                conflict = "live run is not current"
+            elif witness_bound_run_ids and task_row["status"] != "running":
+                conflict = f"{task_row['status']} task with live witnessed run"
+            elif live_runs and task_row["status"] != "running":
+                conflict = f"{task_row['status']} task with live run"
+            elif task_row["status"] == "running" and not live_runs:
+                conflict = "running task without coherent live run"
+
+            if conflict:
+                state_conflicts.append(f"{task_id} ({conflict})")
+            elif live_runs and live_runs[0]["run_id"] in witness_bound_run_ids:
+                continue  # witnessed executor — not an extra active worker
+            elif live_runs:
+                active.append(
+                    f"{task_id} ({task_row['assignee'] or 'unassigned'})"
+                )
+            elif task_row["status"] == "blocked":
+                blockers.append(task_id)
+            elif task_row["status"] in {"todo", "scheduled", "ready", "review"}:
+                pending.append(f"{task_id} ({task_row['status']})")
     return {
         "marker": HANDOFF_MARKER,
         "mission": umbrella.title if umbrella else gate.title,
+        "mission_task_id": umbrella.id if umbrella else gate.id,
         "gate_id": gate.id,
         "gate_status": gate.status,
         "verdict": verdict,
         "active_workers": active,
         "running_evidence": running_evidence,
+        "pending_work": pending,
         "blockers": blockers,
+        "state_conflicts": state_conflicts,
         "repo_state": repo,
     }
 
@@ -5615,7 +5723,11 @@ def _last_handoff_payload(conn: sqlite3.Connection, task_id: str) -> Optional[di
 
 
 def _execution_witness_for(
-    conn: sqlite3.Connection, execution: Optional[dict],
+    conn: sqlite3.Connection,
+    execution: Optional[dict],
+    *,
+    mission_task_id: Optional[str] = None,
+    action_type: Optional[str] = None,
 ) -> Optional[dict]:
     """Validate + normalise a persisted execution witness/materialization.
 
@@ -5627,6 +5739,14 @@ def _execution_witness_for(
     only when the run row exists. Missing/unknown/invalid input returns None
     so the caller must fail closed — AUTO is never persisted on the
     resolver's word alone.
+
+    Same-mission correlation: when ``mission_task_id`` is supplied the run
+    must ALSO be bound to that mission by a persisted machine-readable
+    relation — a ``task_links`` path from its task up to the mission umbrella
+    and a matching ``execution_witness`` event naming both the mission and the
+    action. A real run row from another mission is NOT a witness for this
+    handoff and fails closed here, so no unrelated live run can authorize an
+    AUTO/STARTING transition or be described as same-mission recovery.
     """
     if not isinstance(execution, dict):
         return None
@@ -5649,6 +5769,10 @@ def _execution_witness_for(
     ).fetchone()
     if not row:
         return None
+    if mission_task_id is not None and not _run_is_bound_to_mission(
+        conn, run_id, row["task_id"], mission_task_id, action_type,
+    ):
+        return None
     return {
         "source": "task_run",
         "run_id": int(row["id"]),
@@ -5660,6 +5784,69 @@ def _execution_witness_for(
         "claim_expires": row["claim_expires"],
         "last_heartbeat_at": row["last_heartbeat_at"],
     }
+
+
+def _run_is_bound_to_mission(
+    conn: sqlite3.Connection,
+    run_id: int,
+    task_id: str,
+    mission_task_id: str,
+    action_type: Optional[str],
+) -> bool:
+    """Return True only when a persisted relation binds run → task → mission.
+
+    Both relations must exist and agree:
+
+    - the executor task is linked below the mission umbrella (recursive
+      ``task_links`` walk from ``mission_task_id``), and
+    - a persisted ``execution_witness`` event on the executor task names this
+      ``run_id``, this mission, and the action being witnessed.
+    """
+    linked = conn.execute(
+        "WITH RECURSIVE mission_tasks(id) AS ("
+        "  SELECT ? "
+        "  UNION "
+        "  SELECT l.child_id FROM task_links l "
+        "  JOIN mission_tasks m ON l.parent_id = m.id"
+        ") SELECT 1 FROM mission_tasks WHERE id = ?",
+        (mission_task_id, task_id),
+    ).fetchone()
+    if not linked:
+        return False
+    bound = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+        "AND run_id = ? AND payload LIKE ? LIMIT 1",
+        (
+            task_id,
+            EXECUTION_WITNESS_EVENT_KIND,
+            run_id,
+            f'%"{mission_task_id}"%',
+        ),
+    ).fetchone()
+    if not bound:
+        return False
+    if action_type is not None:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+            "AND run_id = ? AND payload LIKE ? "
+            "ORDER BY id DESC LIMIT 1",
+            (
+                task_id,
+                EXECUTION_WITNESS_EVENT_KIND,
+                run_id,
+                f'%"{mission_task_id}"%',
+            ),
+        ).fetchone()
+        if not row or not row["payload"]:
+            return False
+        try:
+            payload = json.loads(row["payload"])
+        except Exception:
+            return False
+        bound_action = str(payload.get("actionType") or "").strip().upper()
+        if bound_action != str(action_type or "").strip().upper():
+            return False
+    return True
 
 
 def _is_live_execution_witness(witness: Optional[dict], now: Optional[int] = None) -> bool:
@@ -5765,7 +5952,12 @@ def emit_terminal_handoff(
     fail_closed = False
     witness: Optional[dict] = None
     if decision_class == AUTO:
-        witness = _execution_witness_for(conn, execution_witness)
+        witness = _execution_witness_for(
+            conn,
+            execution_witness,
+            mission_task_id=snapshot.get("mission_task_id"),
+            action_type=next_action.get("type"),
+        )
         if witness is None:
             # Never persist AUTO/STARTING merely because the resolver said
             # AUTO: without a real persisted execution witness/materialization
@@ -5780,6 +5972,14 @@ def emit_terminal_handoff(
         else ACTION_STATUS_RUNNING
         if running_evidence
         else ACTION_STATUS_STARTING
+    )
+    discussion = resolve_discussion_lifecycle(
+        snapshot,
+        next_action=next_action,
+        decision_class=decision_class,
+        action_status=action_status,
+        execution_witness=witness,
+        execution_is_live=_is_live_execution_witness(witness),
     )
     repo_txt = ""
     if snapshot["repo_state"]:
@@ -5869,11 +6069,18 @@ def emit_terminal_handoff(
         f"Active workers: {workers_txt}\n"
         f"Unresolved blockers: {blockers_txt}{repo_txt}\n"
         f"Analysis: {analysis}\n"
+        "## NEXT ACTION\n"
         f"Next action: {next_action.get('type', 'NONE')} — "
         f"{next_action.get('reason', '')}\n"
+        "## DISCUSSION STATUS\n"
+        f"Discussion status: {discussion['status']}\n"
+        "## DISCUSSION ACTION\n"
+        f"Discussion action: {discussion['action']}\n"
+        "## DECISION CLASS\n"
         f"Decision class: {decision_txt}\n"
-        f"Rationale: {next_action.get('rationale', '')}{approval_txt}\n"
+        "## ACTION STATUS\n"
         f"Action status: {action_status}{execution_txt}\n"
+        f"Rationale: {next_action.get('rationale', '')}{approval_txt}\n"
         f"Sequence:\n{seq_txt}\n"
         f"{closing_txt}{delivery_wait_txt}"
     )
@@ -5960,6 +6167,7 @@ def emit_terminal_handoff(
                     "failClosedToApproval": fail_closed,
                     "autonomyMode": (autonomy_policy or DEFAULT_AUTONOMY_POLICY).get("mode"),
                 },
+                "discussion": discussion,
                 "execution": witness,
                 "autoContinue": decision_class == AUTO,
                 "recomputed": bool(recompute and has_marker),
@@ -6094,9 +6302,41 @@ def watchdog_terminal_handoffs(conn: sqlite3.Connection, *, board=None) -> list[
             f"(gate {gate_id or '?'}, {run_label}); corrective evidence "
             "recorded — approval required."
         )
+        gate_task = get_task(conn, gate_id) if gate_id else None
+        mission_task = get_task(conn, task_id)
+        if gate_task is not None:
+            snapshot = synthesize_terminal_handoff(conn, gate_task, mission_task)
+        else:
+            snapshot = {
+                "mission_task_id": task_id,
+                "gate_id": gate_id,
+                "gate_status": None,
+                "active_workers": [],
+                "pending_work": [],
+                "blockers": [],
+                "state_conflicts": ["missing gate identity"],
+            }
+        discussion = resolve_discussion_lifecycle(
+            snapshot,
+            next_action={"type": action_type, "requiresApproval": True},
+            decision_class=APPROVAL_REQUIRED,
+            action_status=ACTION_STATUS_AWAITING_APPROVAL,
+            execution_witness=witness,
+            execution_is_live=False,
+        )
         comment_body = (
             f"{HANDOFF_MARKER} (WATCHDOG — STARTING auto action without live "
             "execution run/witness/heartbeat)\n"
+            "## NEXT ACTION\n"
+            f"Next action: {action_type}\n"
+            "## DISCUSSION STATUS\n"
+            f"Discussion status: {discussion['status']}\n"
+            "## DISCUSSION ACTION\n"
+            f"Discussion action: {discussion['action']}\n"
+            "## DECISION CLASS\n"
+            f"Decision class: {APPROVAL_REQUIRED}\n"
+            "## ACTION STATUS\n"
+            f"Action status: {ACTION_STATUS_AWAITING_APPROVAL}\n"
             f"Corrected {action_type} {ACTION_STATUS_STARTING} -> "
             f"{APPROVAL_REQUIRED} / {ACTION_STATUS_AWAITING_APPROVAL}. "
             f"{reason}"
@@ -6117,6 +6357,7 @@ def watchdog_terminal_handoffs(conn: sqlite3.Connection, *, board=None) -> list[
                         "decisionClass": APPROVAL_REQUIRED,
                         "actionStatus": ACTION_STATUS_AWAITING_APPROVAL,
                     },
+                    "discussion": discussion,
                     "reason": reason,
                     "autoContinue": False,
                 },
@@ -6160,6 +6401,10 @@ ACTION_STATUS_AWAITING_APPROVAL = "AWAITING_APPROVAL"
 ACTION_STATUS_BLOCKED = "BLOCKED"
 ACTION_STATUS_COMPLETED = "COMPLETED"
 ACTION_STATUS_FAILED = "FAILED"
+
+DISCUSSION_ARCHIVE_READY = "ARCHIVE_READY"
+DISCUSSION_KEEP_OPEN = "KEEP_OPEN"
+DISCUSSION_OWNER_ACTION_REQUIRED = "OWNER_ACTION_REQUIRED"
 
 AUTO_CONTINUE_EVENT_KIND = "auto_continue"
 # Persisted execution-witness event kind: written by an executor when it
@@ -6631,6 +6876,158 @@ def resolve_next_action(
         "nextAction": action_type,
         "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
         "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
+    }
+
+
+def resolve_discussion_lifecycle(
+    snapshot: dict,
+    *,
+    next_action: dict,
+    decision_class: Optional[str],
+    action_status: Optional[str],
+    execution_witness: Optional[dict] = None,
+    execution_is_live: bool = False,
+) -> dict:
+    """Project persisted handoff facts onto the operator discussion lifecycle.
+
+    This does not classify autonomy or authorize work. It consumes the existing
+    next-action decision and returns only the additive discussion status/action.
+    Unknown or incomplete states fail closed to owner review.
+    """
+    action_type = str(next_action.get("type") or "").strip().upper()
+    terminal = snapshot.get("gate_status") in {"done", "archived"}
+    inactive = not any(
+        snapshot.get(key) for key in ("active_workers", "pending_work", "blockers")
+    )
+    evidence = {
+        "missionTaskId": snapshot.get("mission_task_id"),
+        "gateId": snapshot.get("gate_id"),
+        "gateStatus": snapshot.get("gate_status"),
+        "activeWorkers": list(snapshot.get("active_workers") or []),
+        "pendingWork": list(snapshot.get("pending_work") or []),
+        "blockers": list(snapshot.get("blockers") or []),
+        "stateConflicts": list(snapshot.get("state_conflicts") or []),
+        "nextAction": action_type or None,
+        "decisionClass": decision_class,
+        "actionStatus": action_status,
+        "executionWitness": execution_witness,
+        "executionLive": bool(execution_is_live),
+    }
+    if snapshot.get("state_conflicts"):
+        return {
+            "status": DISCUSSION_OWNER_ACTION_REQUIRED,
+            "action": (
+                "Action du propriétaire requise : état non démontré ou contradictoire; "
+                "vérification requise. Ne pas archiver et ne pas exécuter "
+                "automatiquement l’action protégée."
+            ),
+            "reason": "insufficient_or_conflicting_evidence",
+            "evidence": evidence,
+        }
+    if (
+        decision_class == APPROVAL_REQUIRED
+        or bool(next_action.get("requiresApproval"))
+        or action_status == ACTION_STATUS_AWAITING_APPROVAL
+    ):
+        if action_type in {"DELIVERY_CHECKPOINT", "PUSH_CHECKPOINT"}:
+            subject = "l’approbation de livraison"
+            protection = "Aucune modification ni livraison n’est effectuée"
+        elif action_type in {"INTEGRATION_REVIEW", "MERGE", "MERGE_MAIN"}:
+            subject = "l’approbation du merge"
+            protection = "Aucun merge n’est effectué"
+        else:
+            subject = "l’approbation de l’action proposée"
+            protection = "Aucune exécution protégée n’est effectuée"
+        return {
+            "status": DISCUSSION_OWNER_ACTION_REQUIRED,
+            "action": (
+                f"Action du propriétaire requise : {subject}. {protection} sans "
+                "approbation; ne pas archiver."
+            ),
+            "reason": "owner_approval_required",
+            "evidence": evidence,
+        }
+    if snapshot.get("pending_work") and not (
+        snapshot.get("blockers") or snapshot.get("state_conflicts")
+    ):
+        pending_kind = (
+            "une remediation"
+            if action_type == "REMEDIATION"
+            else "une validation, gate ou livraison"
+        )
+        return {
+            "status": DISCUSSION_KEEP_OPEN,
+            "action": (
+                f"Poursuivre le suivi : {pending_kind} de la même mission est "
+                "encore attendue; ne pas archiver."
+            ),
+            "reason": "same_mission_work_pending",
+            "evidence": evidence,
+        }
+    if snapshot.get("active_workers") and not (
+        snapshot.get("blockers") or snapshot.get("state_conflicts")
+    ):
+        return {
+            "status": DISCUSSION_KEEP_OPEN,
+            "action": (
+                "Poursuivre le suivi : un worker de la même mission est encore "
+                "actif; ne pas archiver."
+            ),
+            "reason": "same_mission_worker_active",
+            "evidence": evidence,
+        }
+    if (
+        decision_class == AUTO
+        and action_status == ACTION_STATUS_STARTING
+        and execution_witness
+        and execution_is_live
+        and not (snapshot.get("blockers") or snapshot.get("state_conflicts"))
+    ):
+        return {
+            "status": DISCUSSION_KEEP_OPEN,
+            "action": (
+                "Poursuivre le suivi : une recovery AUTO de la même mission est "
+                "matérialisée et active; ne pas archiver."
+            ),
+            "reason": "auto_continuation_active",
+            "evidence": evidence,
+        }
+    if decision_class == AUTO and action_status == ACTION_STATUS_STARTING:
+        return {
+            "status": DISCUSSION_OWNER_ACTION_REQUIRED,
+            "action": (
+                "Action du propriétaire requise : État non démontré; la continuation "
+                "AUTO n’a pas de witness d’exécution actif. Ne pas archiver et ne "
+                "pas exécuter automatiquement l’action protégée."
+            ),
+            "reason": "auto_start_without_live_execution_witness",
+            "evidence": evidence,
+        }
+    if (
+        terminal
+        and inactive
+        and action_type in {"", "NONE", "CLOSE_MISSION", "ARCHIVE"}
+        and not bool(next_action.get("requiresApproval"))
+        and decision_class == AUTO
+        and action_status == ACTION_STATUS_EXECUTED
+    ):
+        return {
+            "status": DISCUSSION_ARCHIVE_READY,
+            "action": (
+                "Aucune action requise : mission terminée, aucun suivi actif détecté. "
+                "Archivage autorisé."
+            ),
+            "reason": "terminal_without_same_mission_follow_up",
+            "evidence": evidence,
+        }
+    return {
+        "status": DISCUSSION_OWNER_ACTION_REQUIRED,
+        "action": (
+            "Action du propriétaire requise : état non démontré; vérification requise. "
+            "Ne pas archiver et ne pas exécuter automatiquement l’action protégée."
+        ),
+        "reason": "insufficient_or_conflicting_evidence",
+        "evidence": evidence,
     }
 
 

@@ -364,7 +364,11 @@ def test_g_approval_handoff_emits_exact_french_operator_headings(conn):
         "DECISION CLASS",
         "ACTION STATUS",
     ]
-    positions = [comment.index(heading) for heading in headings]
+    # The structured body (## NEXT ACTION ... ## ACTION STATUS) precedes the
+    # MISSION ARRÊTÉE approval block (discussion-lifecycle extension), so the
+    # order check anchors at the block itself.
+    block_start = comment.index("MISSION ARRÊTÉE")
+    positions = [comment.index(heading, block_start) for heading in headings]
     assert positions == sorted(positions)
     assert "DECISION CLASS: APPROVAL_REQUIRED" in comment
     assert "ACTION STATUS: AWAITING_APPROVAL" in comment
