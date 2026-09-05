@@ -83,7 +83,7 @@ export type SessionRpcOwnerRoute = SessionOwnerRoute
 export function resolveSessionRpcOwner(args: {
   routingSessionId: null | string
   tileOwnerRoute: (storedSessionId: string) => SessionRpcOwnerRoute | undefined
-  sessionOwnerHint: (storedSessionId: string) => SessionRpcOwnerRoute | undefined
+  sessionOwnerHint: (storedSessionId: string) => SessionRpcOwnerRoute | string | undefined
   sessionRowOwner: (storedSessionId: string) => null | SessionRpcOwnerRoute | string | undefined
 }): SessionRpcOwnerRoute | string | undefined {
   const { routingSessionId, sessionOwnerHint, sessionRowOwner, tileOwnerRoute } = args

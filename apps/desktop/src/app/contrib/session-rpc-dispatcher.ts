@@ -77,7 +77,18 @@ export function createSessionRpcDispatcher(deps: SessionRpcDispatcherDeps): Ambi
 
     let owner: SessionOwnerScope = resolveSessionRpcOwner({
       routingSessionId,
-      sessionOwnerHint: storedSessionId => getSessionOwnerHint(storedSessionId),
+      sessionOwnerHint: storedSessionId => {
+        const hint = getSessionOwnerHint(storedSessionId)
+        // A profile-only hint (recorded when a profile-door secondary minted
+        // the session) is not a dialable ROUTE — requestForSessionProfile
+        // would reject its empty connectionId. Normalize it to the bare
+        // profile owner, which routes through requestGatewayForProfile to the
+        // same door.
+        if (hint && !hint.connectionId.trim()) {
+          return hint.profile.trim() || undefined
+        }
+        return hint
+      },
       sessionRowOwner: storedSessionId => knownSessionOwner(ownerLookupSessionRows(), storedSessionId),
       tileOwnerRoute: sessionTileOwnerRoute
     })

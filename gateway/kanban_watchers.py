@@ -225,9 +225,9 @@ class GatewayKanbanWatchersMixin:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
-        ``review_requested``, ``changes_requested``,
+        stored cursor with kind in the terminal/recovery set (``completed``,
+        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``, ``stale``,
+        ``auto_recovery``, ``review_requested``, ``changes_requested``,
         ``block_loop_detected``). Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
         then advances the cursor. The subscription is removed only when the
@@ -263,7 +263,11 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "stale", "auto_recovery", "status", "archived", "unblocked",
+            "block_loop_detected", "review_requested", "changes_requested",
+        )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -616,9 +620,32 @@ class GatewayKanbanWatchersMixin:
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
+                            operator_message = (
+                                str(ev.payload.get("operatorMessage"))
+                                if ev.payload and ev.payload.get("operatorMessage")
+                                else ""
+                            )
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"↻ {board_tag}{tag}Kanban {sub['task_id']} "
+                                f"{operator_message}"
+                                if operator_message
+                                else (
+                                    f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
+                                    f"(pid gone); dispatcher will retry"
+                                )
+                            )
+                        elif kind in {"stale", "auto_recovery"}:
+                            operator_message = (
+                                str(ev.payload.get("operatorMessage"))
+                                if ev.payload and ev.payload.get("operatorMessage")
+                                else (
+                                    "RÉCUPÉRATION AUTO — étape relancée; "
+                                    "aucune action opérateur requise."
+                                )
+                            )
+                            msg = (
+                                f"↻ {board_tag}{tag}Kanban {sub['task_id']} "
+                                f"{operator_message}"
                             )
                         elif kind == "timed_out":
                             limit = 0
@@ -1563,7 +1590,7 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
+                result = _kb.dispatch_once(
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
@@ -1574,6 +1601,33 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
                 )
+                # Terminal mission handoff: after every dispatch tick, scan
+                # for completed role=gate cards and emit their lifecycle
+                # handoff exactly once (idempotent). A final gate ACCEPTED
+                # must transition to an explicit terminal handoff + next-action
+                # proposal, never to a silent stop. The persisted operator
+                # autonomy policy (kanban.autonomy in config.yaml) is applied
+                # so the handoff records the correct decision class; absent
+                # config the built-in auto policy applies. Best-effort — a
+                # handoff failure must not break dispatch.
+                try:
+                    _autonomy_policy = _kb.autonomy_policy_from_config(
+                        {"kanban": kanban_cfg}
+                    )
+                    emitted = _kb.emit_terminal_handoffs_if_due(
+                        conn, board=slug, autonomy_policy=_autonomy_policy,
+                    )
+                    if emitted:
+                        logger.info(
+                            "kanban dispatcher: emitted terminal handoff for gate card(s) %s on board %s",
+                            ",".join(emitted), slug,
+                        )
+                except Exception:
+                    logger.exception(
+                        "kanban dispatcher: terminal-handoff scan failed on board %s",
+                        slug,
+                    )
+                return result
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
                     disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())

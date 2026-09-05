@@ -557,6 +557,82 @@ The orchestrator guidance ships in the worker's system prompt automatically — 
 
 For best results, pair it with a profile whose toolsets are restricted to board operations (`kanban`, `gateway`, `memory`) so the orchestrator literally cannot execute implementation tasks even if it tries.
 
+## Mission lifecycle: terminal handoff (post-gate)
+
+A mission graph does not end when its final gate card completes. Kanban
+distinguishes two terminal events:
+
+- **MISSION EXECUTION COMPLETED** — the gate card is `done`.
+- **MISSION LIFECYCLE HANDOFF COMPLETED** — the orchestrator has posted a
+  synthesized terminal summary **and** a recommended next workflow onto the
+  mission record. Final gate accepted ≠ silent termination.
+
+### Roles
+
+Opt in a card at creation with `--role`:
+
+```bash
+hermes kanban create "Purchasing v1 increment" --role umbrella ...   # tracking parent
+hermes kanban create "Final acceptance gate" --role gate \
+    --parent <umbrella-id> --assignee hotelos-cdp ...                # decision card
+```
+
+- `--role umbrella` marks the mission's tracking parent. It receives the
+  handoff comment.
+- `--role gate` marks the mission's final acceptance card. When it reaches
+  `done`, the terminal-handoff observer fires (exactly once).
+
+Ordinary cards carry no role and never trigger a handoff.
+
+### What happens automatically
+
+The gateway-embedded dispatcher runs the terminal-handoff scan after every
+dispatch tick (`kanban.dispatch_in_gateway`, default on). For every
+`role=gate` card that is `done` and whose umbrella does not yet carry a
+handoff, it:
+
+1. **Synthesizes** the mission snapshot from persisted board state: gate
+   verdict (read from the completed run summary / result — `ACCEPT` /
+   `REJECT` markers), active workers, unresolved blockers, and the git
+   state of the gate's `dir` workspace (dirty? committed? pushed?).
+2. **Resolves the next workflow** (`resolve_next_action`): a rejected gate
+   → `REMEDIATION`; an accepted gate with a dirty tree →
+   `DELIVERY_CHECKPOINT` (verify manifest → stage → review → commit →
+   push); accepted + committed + unpushed → `PUSH_CHECKPOINT`; accepted +
+   pushed → `INTEGRATION_REVIEW`; unresolved blockers / running workers →
+   `AWAITING_DECISION` / `AWAITING_WORKERS`.
+3. **Emits** a `HERMES TERMINAL HANDOFF` comment on the umbrella card plus a
+   `terminal_handoff` event (for gateway notifiers), including
+   `requiresApproval` for the recommended steps.
+
+Emission is **idempotent**: a second scan / restart / replay never
+duplicates the handoff (the marker comment is the dedup key). The handoff is
+persisted board-side, so a restarted session can reconstruct it without any
+chat history.
+
+### Manual scan
+
+```bash
+hermes kanban handoff                 # scan all done role=gate cards, emit missing handoffs
+hermes kanban handoff <gate-id>       # hand off one specific gate card
+hermes kanban handoff --json          # machine-readable emitted list
+```
+
+### Authorization boundaries
+
+The handoff **recommends**; it never performs the destructive step. Commit,
+push, and merge remain approval-gated — the emitted comment states
+`Approval required: YES — awaiting user approval` when the recommended next
+workflow contains such a step. Nothing in the observer stages, commits,
+pushes, or merges.
+
+### Duplicate-work prevention
+
+The handoff never creates follow-up cards. If a later scope request would
+duplicate work already implemented / reviewed / accepted, the CDP records
+`Covered by <cards/runs>; no follow-up created` rather than re-creating the
+graph.
+
 ## Dashboard (GUI)
 
 The `/kanban` CLI and slash command are enough to run the board headlessly, but a visual board is often the right interface for humans-in-the-loop: triage, cross-profile supervision, reading comment threads, and dragging cards between columns. Hermes ships this as a **bundled dashboard plugin** at `plugins/kanban/` — not a core feature, not a separate service — following the model laid out in [Extending the Dashboard](./extending-the-dashboard).

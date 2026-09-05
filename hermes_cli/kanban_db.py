@@ -134,6 +134,13 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Mission-lifecycle role markers (opt-in, set at task creation via
+# ``--role``). ``gate`` marks a task as the mission's final acceptance gate;
+# ``umbrella`` marks a task as the mission's tracking parent. Ordinary tasks
+# carry no role. The terminal-handoff observer only fires for ``gate`` cards
+# and writes the handoff onto the mission's ``umbrella`` parent.
+VALID_MISSION_ROLES = {"gate", "umbrella"}
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -1089,6 +1096,12 @@ class Task:
     current_run_id: Optional[int] = None
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
+    # Mission-lifecycle role marker (``"gate"`` | ``"umbrella"`` | None).
+    # ``gate``: this card is the mission's final acceptance gate; when it
+    # completes, the terminal-handoff observer emits the mission handoff.
+    # ``umbrella``: this card is the mission's tracking parent (receives
+    # the handoff comment). Ordinary tasks have None.
+    role: Optional[str] = None
     # Force-loaded skills for the worker on this task (passed via
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
@@ -1203,6 +1216,7 @@ class Task:
             current_step_key=(
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
+            role=row["role"] if "role" in keys else None,
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             provider_override=(
@@ -1371,6 +1385,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- them; the dispatcher doesn't consult them for routing yet.
     workflow_template_id TEXT,
     current_step_key     TEXT,
+    -- Mission-lifecycle role marker (NULL for ordinary tasks). Opt-in tag
+    -- set at creation via ``--role``: ``gate`` marks the card as the
+    -- mission's final acceptance gate; ``umbrella`` marks the card as the
+    -- mission's tracking parent. Consumed by the terminal-handoff observer
+    -- so a completed gate transitions to an explicit lifecycle handoff
+    -- instead of silently stopping. Purely advisory to the dispatcher.
+    role                 TEXT,
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
@@ -2689,6 +2710,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "role" not in cols:
+        # Mission-lifecycle role marker (gate | umbrella). NULL on existing
+        # rows — they keep the pre-terminal-handoff behaviour (no observer
+        # fires for them) until a card is explicitly tagged at creation.
+        _add_column_if_missing(conn, "tasks", "role", "role TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3194,6 +3220,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    role: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3251,6 +3278,13 @@ def create_task(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
         )
+    if role is not None:
+        role = str(role).strip().lower() or None
+        if role not in VALID_MISSION_ROLES:
+            raise ValueError(
+                f"role must be one of {sorted(VALID_MISSION_ROLES)} or None, "
+                f"got {role!r}"
+            )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
@@ -3508,8 +3542,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, role
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3535,6 +3569,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        role,
                     ),
                 )
                 for pid in parents:
@@ -3910,6 +3945,455 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
         # next dispatcher tick or a manual `hermes kanban recompute` (issue #22459).
         recompute_ready(conn)
     return removed
+
+
+def _reconciliation_refusal(reason: str) -> dict:
+    return {
+        "classification": STATE_INCONSISTENCY,
+        "decisionClass": APPROVAL_REQUIRED,
+        "requiresApproval": True,
+        "actionStatus": ACTION_STATUS_AWAITING_APPROVAL,
+        "ownerAction": "REQUIRED",
+        "requiredAction": "CONFIRM_PERSISTED_STATE",
+        "why": reason,
+        "reason": reason,
+        "unlinked": [],
+        "archived": [],
+        "rerunGate": None,
+    }
+
+
+def reconcile_proven_superseded_dependencies(
+    conn: sqlite3.Connection,
+    *,
+    proof: dict,
+    superseded_task_ids: Iterable[str],
+    rerun_gate_id: str,
+    max_actions: int = 8,
+) -> dict:
+    """Public AUTO mutation boundary; see the inner helper for semantics.
+
+    The whole validate-and-mutate sequence runs under a single IMMEDIATE
+    write transaction, so a concurrent writer cannot interleave between
+    validation reads and the deletes/archives/rerun below.  The inner
+    helper must therefore never open its own transaction.
+    """
+    return _reconcile_proven_superseded_dependencies_unlocked(
+        conn,
+        proof=proof,
+        superseded_task_ids=superseded_task_ids,
+        rerun_gate_id=rerun_gate_id,
+        max_actions=max_actions,
+    )
+
+
+def _reconcile_proven_superseded_dependencies_unlocked(
+    conn: sqlite3.Connection,
+    *,
+    proof: dict,
+    superseded_task_ids: Iterable[str],
+    rerun_gate_id: str,
+    max_actions: int = 8,
+) -> dict:
+    """Acquire the IMMEDIATE write transaction, then validate and mutate."""
+    with write_txn(conn):
+        validated, is_replay = _reconcile_proven_superseded_dependencies_locked(
+            conn,
+            proof=proof,
+            superseded_task_ids=superseded_task_ids,
+            rerun_gate_id=rerun_gate_id,
+            max_actions=max_actions,
+        )
+        if is_replay or validated["decisionClass"] != AUTO:
+            return validated
+        edges = validated["_edges"]
+        superseded = validated["_superseded"]
+        fingerprint = validated["_fingerprint"]
+        result = {
+            key: value
+            for key, value in validated.items()
+            if not key.startswith("_")
+        }
+        _apply_mutations(
+            conn,
+            edges,
+            superseded,
+            rerun_gate_id,
+            result,
+            fingerprint,
+        )
+    return _recompute_and_read_back(
+        conn,
+        edges,
+        superseded,
+        rerun_gate_id,
+        result,
+    )
+
+
+def _reconcile_proven_superseded_dependencies_locked(
+    conn: sqlite3.Connection,
+    *,
+    proof: dict,
+    superseded_task_ids: Iterable[str],
+    rerun_gate_id: str,
+    max_actions: int = 8,
+) -> tuple[dict, bool]:
+    """Validate a bounded reconciliation plan against persisted state.
+
+    Runs under the caller's single IMMEDIATE write transaction.  The return
+    is ``(result, replay)``; ``replay=True`` when the exact fingerprint was
+    already applied and the persisted state still matches it, so the caller
+    must not repeat the mutation.
+
+    This is the mutation boundary for the redacted-output regression class.
+    Raw command output and ``***`` placeholders are never predicates.  Every
+    edge must instead carry a direct checkout predicate with explicit
+    ``observed``, ``invalid`` and ``superseded`` booleans.  Validation is
+    completed by the caller under one IMMEDIATE write transaction, so a
+    concurrent writer cannot interleave between validation and mutation;
+    ambiguity returns ``STATE_INCONSISTENCY / APPROVAL_REQUIRED`` without
+    writing anything.
+
+    The AUTO path only deletes the proven reversible edges, archives the
+    explicitly superseded cards (without deleting their workspace, runs,
+    comments or events), reopens the existing final gate for a fresh run, and
+    then recomputes dependents.  A content-derived idempotency fingerprint
+    makes restart/replay return the original result without repeating writes.
+    """
+    if not isinstance(proof, dict):
+        return _reconciliation_refusal("Direct predicate proof is required."), False
+    checks = proof.get("checks")
+    if (
+        proof.get("kind") != "direct_predicates"
+        or proof.get("source") != "checkout_predicate"
+        or proof.get("redacted_output_used") is not False
+        or not isinstance(checks, list)
+        or not checks
+    ):
+        return (
+            _reconciliation_refusal(
+                "Proof is missing, redacted, or not sourced from direct checkout predicates."
+            ),
+            False,
+        )
+
+    normalized_checks: list[dict] = []
+    for check in checks:
+        if not isinstance(check, dict):
+            return (
+                _reconciliation_refusal(
+                    "Every edge proof must be a structured predicate."
+                ),
+                False,
+            )
+        parent_id = str(check.get("parent_id") or "")
+        child_id = str(check.get("child_id") or "")
+        predicate = str(check.get("predicate") or "")
+        if (
+            not parent_id
+            or not child_id
+            or not predicate
+            or "***" in predicate
+            or check.get("observed") is not True
+            or check.get("invalid") is not True
+            or check.get("superseded") is not True
+        ):
+            return (
+                _reconciliation_refusal(
+                    "An edge is not directly and unambiguously proven invalid/superseded."
+                ),
+                False,
+            )
+        normalized_checks.append({
+            "parent_id": parent_id,
+            "child_id": child_id,
+            "predicate": predicate,
+        })
+
+    if isinstance(superseded_task_ids, (str, bytes)):
+        return (
+            _reconciliation_refusal(
+                "Superseded card ids must be a bounded collection."
+            ),
+            False,
+        )
+    superseded = sorted(set(str(t) for t in superseded_task_ids if t))
+    edges = sorted(
+        (c["parent_id"], c["child_id"], c["predicate"])
+        for c in normalized_checks
+    )
+    edge_pairs = [(parent_id, child_id) for parent_id, child_id, _predicate in edges]
+    if len(edge_pairs) != len(set(edge_pairs)):
+        return (
+            _reconciliation_refusal(
+                "Each dependency edge must have exactly one direct predicate."
+            ),
+            False,
+        )
+    action_count = len(edges) + len(superseded) + 1
+    if not isinstance(max_actions, int) or isinstance(max_actions, bool) or max_actions < 1:
+        return (
+            _reconciliation_refusal(
+                "Recovery action limit must be a positive integer."
+            ),
+            False,
+        )
+    if action_count > min(max_actions, 32):
+        return (
+            _reconciliation_refusal(
+                f"Recovery plan has {action_count} actions; bounded limit is {max_actions}."
+            ),
+            False,
+        )
+    proven_parents = {parent_id for parent_id, _child_id, _predicate in edges}
+    if (
+        not superseded
+        or rerun_gate_id in superseded
+        or set(superseded) != proven_parents
+    ):
+        return (
+            _reconciliation_refusal(
+                "Every card selected for archive must be a directly proven superseded parent."
+            ),
+            False,
+        )
+
+    fingerprint_input = json.dumps(
+        {
+            "edges": edges,
+            "superseded": superseded,
+            "rerun_gate_id": rerun_gate_id,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    fingerprint = hashlib.sha256(fingerprint_input.encode("utf-8")).hexdigest()
+    prior = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC",
+        (rerun_gate_id, RECOVERY_EVENT_KIND),
+    ).fetchall()
+    for row in prior:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("fingerprint") == fingerprint:
+            prior_result = payload.get("result")
+            if isinstance(prior_result, dict):
+                edges_still_removed = all(
+                    not conn.execute(
+                        "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+                        (parent_id, child_id),
+                    ).fetchone()
+                    for parent_id, child_id, _predicate in edges
+                )
+                archived_state_preserved = all(
+                    (task := get_task(conn, task_id)) is not None
+                    and task.status == "archived"
+                    for task_id in superseded
+                )
+                if edges_still_removed and archived_state_preserved:
+                    return prior_result, True
+                return (
+                    _reconciliation_refusal(
+                        "Persisted recovery state drifted after the original reconciliation."
+                    ),
+                    False,
+                )
+
+    gate = get_task(conn, rerun_gate_id)
+    if gate is None or gate.role != "gate" or gate.status != "done" or gate.current_run_id is not None:
+        return (
+            _reconciliation_refusal(
+                "The requested existing final gate is not a completed, idle gate card."
+            ),
+            False,
+        )
+    for parent_id, child_id, _predicate in edges:
+        if not conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, child_id),
+        ).fetchone():
+            return (
+                _reconciliation_refusal(
+                    f"Proven edge {parent_id}->{child_id} no longer matches persisted state."
+                ),
+                False,
+            )
+    for task_id in superseded:
+        task = get_task(conn, task_id)
+        if (
+            task is None
+            or task.status in {"running", "archived"}
+            or task.role in {"umbrella", "gate"}
+        ):
+            return (
+                _reconciliation_refusal(
+                    f"Superseded card {task_id} is missing or not safe to archive automatically."
+                ),
+                False,
+            )
+        persisted_children = {
+            row["child_id"]
+            for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ?",
+                (task_id,),
+            ).fetchall()
+        }
+        proven_children = {
+            child_id
+            for parent_id, child_id, _predicate in edges
+            if parent_id == task_id
+        }
+        if persisted_children != proven_children:
+            return (
+                _reconciliation_refusal(
+                    f"Superseded card {task_id} has an unproven or stale dependency edge."
+                ),
+                False,
+            )
+
+    result = {
+        "classification": INVALID_SUPERSEDED_DEPENDENCY,
+        "decisionClass": AUTO,
+        "requiresApproval": False,
+        "actionStatus": ACTION_STATUS_RECOVERING,
+        "ownerAction": "NONE",
+        "reason": "Direct predicates proved the dependency edges invalid and the cards superseded.",
+        "unlinked": [[parent_id, child_id] for parent_id, child_id, _predicate in edges],
+        "archived": superseded,
+        "rerunGate": rerun_gate_id,
+        "nextAction": "RE_RUN_FINAL_GATE",
+    }
+    result["_edges"] = edges
+    result["_superseded"] = superseded
+    result["_fingerprint"] = fingerprint
+    return result, False
+
+
+def _apply_mutations(
+    conn: sqlite3.Connection,
+    edges: list[tuple[str, str, str]],
+    superseded: list[str],
+    rerun_gate_id: str,
+    result: dict,
+    fingerprint: str,
+) -> None:
+    """Persist the reconciliation writes inside the caller's transaction."""
+    now = int(time.time())
+    for parent_id, child_id, predicate in edges:
+        cur = conn.execute(
+            "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (parent_id, child_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"dependency edge changed during reconciliation: {parent_id}->{child_id}"
+            )
+        _append_event(
+            conn,
+            child_id,
+            "unlinked",
+            {
+                "parent": parent_id,
+                "child": child_id,
+                "reason": "proven_invalid_superseded",
+                "predicate": predicate,
+                "decisionClass": AUTO,
+            },
+        )
+    for task_id in superseded:
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'archived', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status NOT IN ('running', 'archived')",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"superseded card changed during reconciliation: {task_id}"
+            )
+        _append_event(
+            conn,
+            task_id,
+            "archived",
+            {
+                "reason": "superseded_recovery",
+                "historyPreserved": True,
+                "workspacePreserved": True,
+                "decisionClass": AUTO,
+            },
+        )
+    cur = conn.execute(
+        "UPDATE tasks SET status = 'ready', completed_at = NULL, result = NULL, "
+        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+        "last_heartbeat_at = NULL "
+        "WHERE id = ? AND status = 'done' AND current_run_id IS NULL",
+        (rerun_gate_id,),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError("final gate changed during reconciliation")
+    _append_event(
+        conn,
+        rerun_gate_id,
+        "recovery_rerun_scheduled",
+        {
+            "nextAction": "RE_RUN_FINAL_GATE",
+            "decisionClass": AUTO,
+            "actionStatus": ACTION_STATUS_STARTING,
+            "ownerAction": "NONE",
+        },
+    )
+    _append_event(
+        conn,
+        rerun_gate_id,
+        RECOVERY_EVENT_KIND,
+        {
+            "fingerprint": fingerprint,
+            "healthClassification": INVALID_SUPERSEDED_DEPENDENCY,
+            "decisionClass": AUTO,
+            "actionStatus": ACTION_STATUS_RECOVERING,
+            "ownerAction": "NONE",
+            "lastActivity": now,
+            "nextAction": "RE_RUN_FINAL_GATE",
+            "operatorMessage": (
+                "RÉCUPÉRATION AUTO — dépendances invalides retirées, cartes "
+                "superseded archivées avec historique préservé et final gate "
+                "replanifié; aucune action opérateur requise."
+            ),
+            "result": result,
+        },
+    )
+
+    return None
+
+
+def _recompute_and_read_back(
+    conn: sqlite3.Connection,
+    edges: list[tuple[str, str, str]],
+    superseded: list[str],
+    rerun_gate_id: str,
+    result: dict,
+) -> dict:
+    """Recompute dependents after commit, then read every target back."""
+    recompute_ready(conn)
+    # Mandatory read-back: a successful write is not a successful recovery
+    # until every exact target reflects the planned state.
+    if any(
+        parent_ids(conn, child_id).count(parent_id)
+        for parent_id, child_id, _ in edges
+    ):
+        raise RuntimeError("dependency reconciliation read-back failed")
+    archived_tasks = [get_task(conn, task_id) for task_id in superseded]
+    if any(task is None or task.status != "archived" for task in archived_tasks):
+        raise RuntimeError("archive reconciliation read-back failed")
+    refreshed_gate = get_task(conn, rerun_gate_id)
+    if refreshed_gate is None or refreshed_gate.status != "ready":
+        raise RuntimeError("final gate rerun read-back failed")
+    return result
 
 
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
@@ -4608,6 +5092,1127 @@ def recompute_ready(
                 )
                 promoted += 1
     return promoted
+
+
+# ---------------------------------------------------------------------------
+# Terminal mission handoff (post-gate lifecycle)
+# ---------------------------------------------------------------------------
+# A mission's final gate card (role="gate") completing its acceptance run is
+# NOT the end of the mission lifecycle. After the gate is ``done``, the
+# orchestrator must emit a TERMINAL HANDOFF onto the mission umbrella
+# (role="umbrella"): a synthesized summary + recommended next workflow. The
+# functions below are deterministic, read-only-until-emit, and idempotent so
+# a restart / retry never duplicates a handoff.
+
+HANDOFF_MARKER = "HERMES TERMINAL HANDOFF"
+HANDOFF_AUTHOR = "hotelos-cdp"
+HANDOFF_EVENT_KIND = "terminal_handoff"
+
+GATE_ACCEPTED_MARKERS = ("ACCEPT", "PASS")
+GATE_REJECTED_MARKERS = ("REJECT", "CHANGES REQUIRED", "FAIL", "NOT ACCEPTED")
+
+
+def find_mission_parent(conn: sqlite3.Connection, gate_task_id: str) -> Optional[Task]:
+    """Return the mission umbrella for a gate card, if one is tagged.
+
+    Walks the gate's direct parents; returns the first parent whose
+    ``role == 'umbrella'`` (or, absent an umbrella tag, the topmost parent).
+    """
+    parents = conn.execute(
+        "SELECT p.* FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ?",
+        (gate_task_id,),
+    ).fetchall()
+    if not parents:
+        return None
+    tasks = [Task.from_row(r) for r in parents]
+    for t in tasks:
+        if t.role == "umbrella":
+            return t
+    # Fall back to the single parent when there is exactly one (mission graph
+    # convention). With multiple parents and no explicit umbrella, stay None.
+    return tasks[0] if len(tasks) == 1 else None
+
+
+GATE_OPENING_WINDOW = 80  # free-text fallback scans only the verdict's opening statement
+
+# Canonical structured verdict tokens for ``task_runs.metadata['verdict']``
+# and other explicit channels. Normalised case-insensitively; only exact
+# tokens count — never substrings.
+VERDICT_ACCEPT_TOKENS = frozenset({"ACCEPTED", "ACCEPT", "PASS", "PASSED"})
+VERDICT_REJECT_TOKENS = frozenset({
+    "REJECTED", "REJECT", "CHANGES REQUIRED", "CHANGES_REQUIRED",
+    "FAIL", "FAILED", "NOT ACCEPTED", "NOT_ACCEPTED",
+})
+
+# Free-text markers are matched as bounded phrases, NOT raw substrings, so a
+# token inside a stronger phrase cannot double-count ("NOT ACCEPTED" contains
+# "ACCEPT"; "unacceptable" contains "ACCEPT" but is not a verdict). ``PASS`` /
+# ``FAIL`` still match as prefixes inside PASSED/FAILED/FAILING via alternates.
+_PLAIN_ACCEPT_RE = re.compile(r"\bACCEPT(?:ED)?\b|\bPASS(?:ED)?\b")
+_PLAIN_REJECT_RE = re.compile(
+    r"\bNOT ACCEPTED\b|\bCHANGES REQUIRED\b|\bREJECT(?:ED)?\b|\bFAIL(?:ED|ING|URE)?\b"
+)
+# Gate-scoped verdict phrases: strong signal because gate workers open their
+# run summary with the gate's OWN verdict (e.g. 'CDP FINAL GATE ACCEPT — …' or
+# 'Gate rejected at read-back: …'). Scanning these first prevents another
+# card's verdict mentioned in the same opening ('QA ACCEPT …; however the
+# final gate REJECTED') from overriding the gate's own outcome.
+_GATE_ACCEPT_RE = re.compile(
+    r"\bGATE (?:ACCEPT(?:ED)?|PASS(?:ED)?)\b|\bVERDICT:? (?:ACCEPT(?:ED)?|PASS(?:ED)?)\b"
+)
+_GATE_REJECT_RE = re.compile(
+    r"\bGATE REJECT(?:ED)?\b|\bVERDICT:? (?:REJECT(?:ED)?|NOT ACCEPTED)\b"
+)
+
+GATE_ACCEPT_PHRASES = ("GATE ACCEPT", "GATE PASS", "VERDICT: ACCEPT", "VERDICT ACCEPT")
+GATE_REJECT_PHRASES = (
+    "GATE REJECT", "VERDICT: REJECT", "VERDICT REJECT", "VERDICT: NOT ACCEPTED",
+)
+
+
+def _polarity(accept_hits: int, reject_hits: int) -> Optional[bool]:
+    """Single-polarity evidence decides; mixed/absent evidence stays None."""
+    if accept_hits and not reject_hits:
+        return True
+    if reject_hits and not accept_hits:
+        return False
+    return None
+
+
+def _canonical_verdict(value: object) -> Optional[bool]:
+    """Normalise an explicit verdict token (structured channels only).
+
+    Accepts exact canonical tokens case-insensitively (with and without the
+    underscore spelling of multi-word tokens). Anything else — including a
+    prose sentence containing the token — is NOT a structured verdict.
+    """
+    if not isinstance(value, str):
+        return None
+    token = value.strip().upper()
+    if not token:
+        return None
+    if token in VERDICT_ACCEPT_TOKENS:
+        return True
+    if token in VERDICT_REJECT_TOKENS:
+        return False
+    return None
+
+
+def _verdict_from_run_metadata(metadata: object) -> Optional[bool]:
+    """Structured persisted verdict from a completed run's metadata.
+
+    Canonical keys, in order: ``verdict``, then ``gate_outcome`` (the
+    structured outcome field real gate runs persist, e.g.
+    ``{"gate_outcome": "ACCEPT"}``); a ``verdicts`` list is accepted for
+    multi-reviewer runs but must be unanimous. Only exact canonical tokens
+    count (see :func:`_canonical_verdict`) — never substring matches.
+    metadata may arrive as a dict or a JSON string.
+    """
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            return None
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("verdict", "gate_outcome"):
+        if key in metadata:
+            return _canonical_verdict(metadata.get(key))
+    if isinstance(metadata.get("verdicts"), list) and metadata["verdicts"]:
+        parsed = [_canonical_verdict(v) for v in metadata["verdicts"]]
+        if parsed and all(v is True for v in parsed):
+            return True
+        if parsed and all(v is False for v in parsed):
+            return False
+    return None
+
+
+def _verdict_from_marker_text(
+    text: Optional[str], *, window: bool = True,
+) -> Optional[bool]:
+    """Structured-free verdict scan with gate-scoped phrase priority.
+
+    Scans the text (or its opening ``GATE_OPENING_WINDOW`` characters when
+    ``window=True`` — the free-text fallback path). Within the scanned
+    region: first look for the gate's own verdict phrases ('GATE ACCEPT' /
+    'GATE REJECT' / verdict statements). Historical reviewer verdicts
+    mentioned in the opening (e.g. 'Security REJECT -> remediation') cannot
+    flip the outcome because gate-scoped evidence outranks plain markers.
+    If no gate-scoped phrase is present, plain accept/reject markers decide
+    — but ONLY when the opening is single-polarity. Mixed accept+reject
+    evidence in a free-text opening is structurally ambiguous: return None
+    (fail closed toward a human decision) instead of guessing.
+    """
+    if not text:
+        return None
+    region = text[:GATE_OPENING_WINDOW] if window else text
+    upper = region.upper()
+    gate_accept = len(list(_GATE_ACCEPT_RE.finditer(upper)))
+    gate_reject = len(list(_GATE_REJECT_RE.finditer(upper)))
+    verdict = _polarity(gate_accept, gate_reject)
+    if verdict is not None:
+        return verdict
+    # Plain markers: drop accept hits swallowed inside a negative phrase
+    # ("ACCEPT" inside "NOT ACCEPTED") before the polarity test.
+    reject_spans = [m.span() for m in _PLAIN_REJECT_RE.finditer(upper)]
+    accept_spans: list[tuple[int, int]] = []
+    for m in _PLAIN_ACCEPT_RE.finditer(upper):
+        a_start, a_end = m.span()
+        if not any(a_start >= rs and a_end <= re_ for rs, re_ in reject_spans):
+            accept_spans.append((a_start, a_end))
+    return _polarity(len(accept_spans), len(reject_spans))
+
+
+def gate_verdict(conn: sqlite3.Connection, gate: Task) -> Optional[bool]:
+    """Read the gate's verdict, strictly structured-first.
+
+    Returns True (accepted), False (rejected), or None (unknown / not a
+    verdict). Precedence (CDP decision 2026-09-03 after a false-REJECT
+    derivation on the AppStock regression-stabilization gate; extended for
+    the autonomous next-action policy):
+
+    1. **Structured persisted verdict/status fields** — the last completed
+       run's ``metadata`` JSON carrying a canonical ``verdict`` token
+       (``{"verdict": "ACCEPTED"}``). Never substring-matched.
+    2. **Explicit canonical structured result** — ``task.result``, parsed in
+       isolation. It is never concatenated with the run summary, so prose
+       mentioning reviewer history cannot contaminate it.
+    3. **Carefully parsed legacy text fallback** — the last completed run's
+       summary, but only its opening verdict statement (first
+       ``GATE_OPENING_WINDOW`` characters). Gate workers conventionally open
+       the summary with the verdict line (e.g. 'CDP FINAL GATE ACCEPT — …');
+       scanning the whole summary lets historical reviewer verdicts
+       mentioned later (e.g. 'Security REJECT -> remediation') override the
+       gate's own verdict. Ambiguous (mixed-polarity) openings resolve to
+       None — fail closed — never to an arbitrary substring match.
+
+    Gate completions should persist the verdict explicitly via
+    ``complete_task(..., metadata={"verdict": "ACCEPTED"})`` so derivation
+    never depends on prose.
+    """
+    run = conn.execute(
+        "SELECT summary, metadata FROM task_runs WHERE task_id = ? "
+        "AND outcome = 'completed' ORDER BY id DESC LIMIT 1",
+        (gate.id,),
+    ).fetchone()
+    if run:
+        meta_verdict = _verdict_from_run_metadata(run["metadata"] if run else None)
+        if meta_verdict is not None:
+            return meta_verdict
+    if gate.result:
+        verdict = _verdict_from_marker_text(gate.result, window=False)
+        if verdict is not None:
+            return verdict
+    if run and run["summary"]:
+        verdict = _verdict_from_marker_text(run["summary"], window=True)
+        if verdict is not None:
+            return verdict
+    return None
+
+
+def repo_state_for(task: Optional[Task]) -> dict:
+    """Probe the git state of a task's dir workspace (best-effort).
+
+    Returns a dict with ``dirty`` / ``committed`` / ``pushed`` booleans and
+    ``branch``/``head`` when the workspace is a git repo. Any failure returns
+    ``{}`` so the caller can degrade to an approval-required recommendation.
+    """
+    if (
+        task is None
+        or task.workspace_kind not in {"dir", "worktree"}
+        or not task.workspace_path
+    ):
+        return {}
+    ws = Path(task.workspace_path)
+    if not ws.is_dir():
+        return {}
+    try:
+        import subprocess
+
+        def _git(*args: str) -> str:
+            out = subprocess.run(
+                ["git", "-C", str(ws), *args],
+                capture_output=True, text=True, timeout=10,
+            )
+            return out.stdout.strip()
+
+        head = _git("rev-parse", "--short", "HEAD")
+        branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+        dirty = bool(_git("status", "--porcelain"))
+        # Count unpushed commits without rev-list @{u} syntax edge cases.
+        ahead = _git("rev-list", "--count", "HEAD", "--not", "--remotes")
+        last_commit = _git("log", "-1", "--format=%ct")
+        try:
+            ahead_n = int(ahead) if ahead else 0
+        except ValueError:
+            ahead_n = 0
+        try:
+            last_commit_at = int(last_commit) if last_commit else None
+        except ValueError:
+            last_commit_at = None
+        return {
+            "branch": branch or None,
+            "head": head or None,
+            "dirty": bool(dirty),
+            "committed": bool(head),
+            "pushed": ahead_n == 0 and bool(head),
+            "unpushed_commits": ahead_n,
+            "last_commit_at": last_commit_at,
+        }
+    except Exception:
+        return {}
+
+
+def synthesize_terminal_handoff(
+    conn: sqlite3.Connection, gate: Task, umbrella: Optional[Task],
+) -> dict:
+    """Synthesize the terminal mission snapshot (no writes)."""
+    verdict = gate_verdict(conn, gate)
+    repo = repo_state_for(gate) or repo_state_for(umbrella)
+    # Active workers: any running task whose parent chain includes umbrella.
+    active: list[str] = []
+    running_evidence: list[dict] = []
+    if umbrella is not None:
+        rows = conn.execute(
+            "SELECT id, title, assignee, status, worker_pid, current_run_id, "
+            "last_heartbeat_at FROM tasks WHERE status = 'running'"
+        ).fetchall()
+        for row in rows:
+            if row["id"] == umbrella.id:
+                continue
+            linked = conn.execute(
+                "SELECT 1 FROM task_links WHERE child_id = ? AND parent_id = ?",
+                (row["id"], umbrella.id),
+            ).fetchone()
+            if linked:
+                active.append(f"{row['id']} ({row['assignee'] or 'unassigned'})")
+                heartbeat = (
+                    int(row["last_heartbeat_at"])
+                    if row["last_heartbeat_at"] is not None
+                    else None
+                )
+                activity = conn.execute(
+                    "SELECT created_at FROM task_events WHERE task_id = ? "
+                    "AND kind IN ('activity', 'progress', 'tool_progress') "
+                    "ORDER BY created_at DESC, id DESC LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                activity_at = (
+                    int(activity["created_at"])
+                    if activity is not None
+                    else None
+                )
+                last_activity = max(
+                    value for value in (heartbeat, activity_at) if value is not None
+                ) if heartbeat is not None or activity_at is not None else None
+                worker_pid = int(row["worker_pid"]) if row["worker_pid"] else None
+                worker_alive = _pid_alive(worker_pid) if worker_pid else None
+                if row["current_run_id"] is not None and (
+                    worker_alive is True
+                    or (
+                        heartbeat is not None
+                        and int(time.time()) - heartbeat < _STALE_HEARTBEAT_GAP_SECONDS
+                    )
+                ):
+                    running_evidence.append({
+                        "workerPid": worker_pid,
+                        "runId": int(row["current_run_id"]),
+                        "lastHeartbeat": heartbeat,
+                        "lastActivity": last_activity,
+                        "currentTask": row["id"],
+                    })
+    blockers: list[str] = []
+    if umbrella is not None:
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE status = 'blocked' AND id != ?",
+            (umbrella.id,),
+        ).fetchall():
+            if conn.execute(
+                "SELECT 1 FROM task_links WHERE child_id = ? AND parent_id = ?",
+                (row["id"], umbrella.id),
+            ).fetchone():
+                blockers.append(row["id"])
+    return {
+        "marker": HANDOFF_MARKER,
+        "mission": umbrella.title if umbrella else gate.title,
+        "gate_id": gate.id,
+        "gate_status": gate.status,
+        "verdict": verdict,
+        "active_workers": active,
+        "running_evidence": running_evidence,
+        "blockers": blockers,
+        "repo_state": repo,
+    }
+
+
+def _last_handoff_verdict(conn: sqlite3.Connection, task_id: str) -> Optional[bool]:
+    """Structured verdict stored by the most recent terminal handoff event."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, HANDOFF_EVENT_KIND),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return None
+    verdict = (payload or {}).get("verdict")
+    if verdict == "ACCEPTED":
+        return True
+    if verdict and str(verdict).startswith("REJECT"):
+        return False
+    return None
+
+
+def _last_handoff_next_action_type(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Action type stored by the most recent terminal handoff event."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, HANDOFF_EVENT_KIND),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return None
+    payload = payload or {}
+    na = payload.get("next_action") or payload.get("decision") or {}
+    if isinstance(na, dict):
+        return na.get("type") or na.get("actionType")
+    return None
+
+
+
+def emit_terminal_handoff(
+    conn: sqlite3.Connection,
+    gate: Task,
+    board: Optional[str] = None,
+    *,
+    recompute: bool = False,
+    autonomy_policy: Optional[dict] = None,
+) -> bool:
+    """Emit the terminal handoff for a completed gate card, exactly once.
+
+    Idempotency: scans existing comments on the umbrella for the handoff
+    marker; if already present, returns False without writing. Otherwise
+    posts the synthesized handoff comment onto the umbrella card (source of
+    truth) and records a ``terminal_handoff`` event for gateway notifiers.
+    The event payload carries the full structured end-of-step decision —
+    analysis, next action, decision class (AUTO / APPROVAL_REQUIRED),
+    rationale, and action status — so Mission Control can render the
+    decision and a restarted orchestrator never needs to re-derive it.
+
+    When the decision class is AUTO, a deduplicated ``auto_continue`` event
+    is recorded on the same card as the persisted continuation intent: a
+    restart / replay that re-scans the board sees the existing handoff and
+    emits nothing new, so an auto-launched workflow is never duplicated.
+
+    ``recompute=True`` re-derives the snapshot from current persisted state
+    and, when the freshly derived verdict differs from the verdict stored by
+    the most recent handoff event, appends a corrective handoff comment +
+    event (marked RECOMPUTED). The original handoff record is preserved for
+    audit; consumers that prefer the newest event see the corrected verdict.
+    When the derived verdict matches the stored one (or no prior handoff
+    exists) behaviour is unchanged: no second emission.
+
+    ``autonomy_policy`` is the normalised operator autonomy policy (see
+    :func:`autonomy_policy_from_config`); None = built-in auto policy.
+    """
+    umbrella = find_mission_parent(conn, gate.id)
+    target_id = umbrella.id if umbrella is not None else gate.id
+    prior = list_comments(conn, target_id)
+    has_marker = any(HANDOFF_MARKER in c.body for c in prior)
+    if recompute and has_marker:
+        derived = gate_verdict(conn, gate)
+        stored = _last_handoff_verdict(conn, target_id)
+        # Refresh the persisted decision when the resolved next action has
+        # moved even if the verdict itself is unchanged (repo state advanced,
+        # e.g. dirty -> committed -> pushed), so the newest handoff record
+        # always carries the current workflow stage.
+        probe_snapshot = synthesize_terminal_handoff(conn, gate, umbrella)
+        probe_next = resolve_next_action(
+            probe_snapshot, autonomy_policy=autonomy_policy,
+        )
+        stored_type = _last_handoff_next_action_type(conn, target_id)
+        if derived is None or (
+            stored == derived and stored_type == probe_next.get("type")
+        ):
+            return False
+    elif not recompute and has_marker:
+        return False
+    snapshot = synthesize_terminal_handoff(conn, gate, umbrella)
+    next_action = resolve_next_action(
+        snapshot, autonomy_policy=autonomy_policy,
+    )
+    verdict_txt = {
+        True: "ACCEPTED", False: "REJECTED / CHANGES REQUIRED", None: "NO EXPLICIT VERDICT",
+    }.get(snapshot["verdict"], "NO EXPLICIT VERDICT")
+    decision_class = next_action.get("decisionClass") or APPROVAL_REQUIRED
+    running_evidence = snapshot.get("running_evidence") or []
+    owner_action = "REQUIRED" if decision_class == APPROVAL_REQUIRED else "NONE"
+    action_status = (
+        ACTION_STATUS_AWAITING_APPROVAL
+        if decision_class == APPROVAL_REQUIRED
+        else ACTION_STATUS_RUNNING
+        if running_evidence
+        else ACTION_STATUS_STARTING
+    )
+    repo_txt = ""
+    if snapshot["repo_state"]:
+        rs = snapshot["repo_state"]
+        repo_txt = (
+            f"\nRepository: branch={rs.get('branch') or '?'} "
+            f"dirty={rs.get('dirty')} committed={rs.get('committed')} "
+            f"pushed={rs.get('pushed')} unpushed={rs.get('unpushed_commits', 0)}"
+        )
+    workers_txt = (
+        ", ".join(snapshot["active_workers"]) if snapshot["active_workers"] else "none"
+    )
+    blockers_txt = (
+        ", ".join(snapshot["blockers"]) if snapshot["blockers"] else "none"
+    )
+    analysis = (
+        f"Final gate {snapshot['gate_id']} completed: {verdict_txt}. "
+        f"Active workers: {workers_txt}; unresolved blockers: {blockers_txt}."
+    )
+    decision_txt = (
+        f"{decision_class} — action autorisée; exécution non déduite de nextAction."
+        if decision_class == AUTO
+        else f"{decision_class} — awaiting operator approval."
+    )
+    approval_txt = (
+        "\nApproval required: YES — this action crosses the approval boundary."
+        if next_action.get("requiresApproval")
+        else "\nApproval required: no (low-risk, in-scope action)."
+    )
+    seq_txt = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(next_action.get("sequence", [])))
+    running_txt = "\n".join(
+        "  worker={workerPid} run={runId} lastHeartbeat={lastHeartbeat} "
+        "lastActivity={lastActivity} currentTask={currentTask}".format(**item)
+        for item in running_evidence
+    )
+    marker_line = HANDOFF_MARKER
+    if recompute and has_marker:
+        marker_line = (
+            f"{HANDOFF_MARKER} (RECOMPUTED — structured verdict supersedes "
+            "the prior derivation)"
+        )
+    if decision_class == APPROVAL_REQUIRED:
+        closing_txt = (
+            f"Next step: {next_action.get('type', 'NONE')}. Awaiting your approval."
+        )
+    elif action_status == ACTION_STATUS_RUNNING:
+        closing_txt = (
+            f"Next step: {next_action.get('type', 'NONE')} — live execution observed."
+        )
+    else:
+        closing_txt = (
+            f"Next step: {next_action.get('type', 'NONE')} — planned; "
+            "execution not yet observed."
+        )
+    common_body = (
+        f"{marker_line}\n"
+        f"Mission: {snapshot['mission']}\n"
+        f"Final gate {snapshot['gate_id']}: {verdict_txt}\n"
+        f"Active workers: {workers_txt}\n"
+        f"Unresolved blockers: {blockers_txt}{repo_txt}\n"
+        f"Analysis: {analysis}\n"
+        f"Next action: {next_action.get('type', 'NONE')} — "
+        f"{next_action.get('reason', '')}\n"
+        f"Decision class: {decision_txt}\n"
+        f"Rationale: {next_action.get('rationale', '')}{approval_txt}\n"
+        f"Sequence:\n{seq_txt}\n"
+    )
+    if decision_class == AUTO:
+        if action_status == ACTION_STATUS_RUNNING:
+            body = (
+                f"{common_body}"
+                "ACTIF\n"
+                "Hermes exécute la mission avec un worker/run observé.\n"
+                "OWNER ACTION: NONE\n"
+                f"ACTION STATUS: {ACTION_STATUS_RUNNING}\n"
+                "RUNNING EVIDENCE\n"
+                f"{running_txt}\n"
+                f"{closing_txt}"
+            )
+        else:
+            body = (
+                f"{common_body}"
+                "ACTION AUTO PLANIFIÉE\n"
+                "OWNER ACTION: NONE\n"
+                f"ACTION STATUS: {ACTION_STATUS_STARTING}\n"
+                "L’action est matérialisée mais son exécution n’est pas encore "
+                "observée; aucune action opérateur requise.\n"
+                f"{closing_txt}"
+            )
+    else:
+        body = (
+            f"{common_body}"
+            "MISSION ARRÊTÉE\n"
+            "Cause\n"
+            f"{next_action.get('reason', '') or 'Non disponible'}\n"
+            "Étape bloquée\n"
+            f"Final gate {snapshot['gate_id']}\n"
+            "Pourquoi Hermes ne peut pas continuer seul\n"
+            f"{next_action.get('rationale', '') or 'Confirmation Hermes requise'}\n"
+            "Solution recommandée\n"
+            f"Confirmer dans Hermes la prochaine action {next_action.get('type', 'NONE')}.\n"
+            "Impact si aucune action\n"
+            "La mission reste arrêtée à cette étape.\n"
+            "RECOMMENDED OWNER DECISION\n"
+            "OWNER ACTION: REQUIRED\n"
+            f"REQUIRED ACTION: Confirmer ou refuser {next_action.get('type', 'NONE')} "
+            "dans Hermes.\n"
+            f"WHY: {next_action.get('rationale', '') or 'Confirmation Hermes requise'}\n"
+            "READY-TO-SEND PROMPT\n"
+            "Non disponible — transmettre la décision directement dans Hermes.\n"
+            f"DECISION CLASS: {APPROVAL_REQUIRED}\n"
+            f"ACTION STATUS: {ACTION_STATUS_AWAITING_APPROVAL}\n"
+            "L’approbation et l’exécution passent par Hermes.\n"
+            f"{closing_txt}"
+        )
+    with write_txn(conn):
+        add_comment(conn, target_id, HANDOFF_AUTHOR, body)
+        _append_event(
+            conn, target_id, HANDOFF_EVENT_KIND,
+            {
+                "marker": HANDOFF_MARKER,
+                "mission": snapshot["mission"],
+                "gate_id": gate.id,
+                "verdict": verdict_txt,
+                "repo_state": snapshot["repo_state"],
+                "next_action": {
+                    "type": next_action.get("type"),
+                    "requiresApproval": next_action.get("requiresApproval"),
+                    "reason": next_action.get("reason"),
+                },
+                "decision": {
+                    "actionType": next_action.get("type"),
+                    "decisionClass": decision_class,
+                    "requiresApproval": bool(next_action.get("requiresApproval")),
+                    "rationale": next_action.get("rationale"),
+                    "actionStatus": action_status,
+                    "ownerAction": owner_action,
+                    "requiredAction": (
+                        f"Confirmer ou refuser {next_action.get('type', 'NONE')} dans Hermes."
+                        if owner_action == "REQUIRED"
+                        else None
+                    ),
+                    "why": next_action.get("rationale"),
+                    "runningEvidence": running_evidence,
+                    "analysis": analysis,
+                    "autonomyMode": (autonomy_policy or DEFAULT_AUTONOMY_POLICY).get("mode"),
+                },
+                "autoContinue": decision_class == AUTO,
+                "recomputed": bool(recompute and has_marker),
+                "healthClassification": (
+                    ACTIVE if has_marker else COMPLETED_UNHANDED
+                ),
+                "lastActivity": int(time.time()),
+                "nextAction": next_action.get("type"),
+                "ownerAction": owner_action,
+                "actionStatus": action_status,
+                "runningEvidence": running_evidence,
+            },
+        )
+        if decision_class == AUTO:
+            _append_event(
+                conn, target_id, AUTO_CONTINUE_EVENT_KIND,
+                {
+                    "gate_id": gate.id,
+                    "actionType": next_action.get("type"),
+                    "decisionClass": AUTO,
+                    "actionStatus": action_status,
+                },
+            )
+    return True
+
+
+def emit_terminal_handoffs_if_due(
+    conn: sqlite3.Connection,
+    board: Optional[str] = None,
+    *,
+    autonomy_policy: Optional[dict] = None,
+) -> list[str]:
+    """Scan for done ``role='gate'`` cards and emit their handoffs once.
+
+    Deterministic + idempotent: returns the list of gate task ids that got a
+    fresh handoff. Cards whose umbrella already carries the marker are
+    skipped, so restart/replay across a gateway restart never duplicates a
+    handoff or its recorded auto-continuation. Safe to call on every
+    dispatcher tick.
+    """
+    emitted: list[str] = []
+    for row in conn.execute(
+        "SELECT * FROM tasks WHERE role = 'gate' AND status = 'done'"
+    ).fetchall():
+        gate = Task.from_row(row)
+        try:
+            if emit_terminal_handoff(
+                conn, gate, board=board, autonomy_policy=autonomy_policy,
+            ):
+                emitted.append(gate.id)
+        except Exception:
+            # A failing handoff must never break the dispatcher tick.
+            continue
+    return emitted
+
+
+# ---------------------------------------------------------------------------
+# Autonomous next-action policy (decision classes)
+# ---------------------------------------------------------------------------
+# Every resolved next action carries an explicit decision class — AUTO or
+# APPROVAL_REQUIRED — so the operator policy is machine-readable, never
+# implicit prose. Classification is a PURE function of (action identity,
+# repository context, operator policy): the board records the decision;
+# Mission Control renders it; the orchestrator (Hermes) executes AUTO actions
+# and stops for APPROVAL_REQUIRED ones. Defaults are conservative:
+# unknown actions and unverifiable contexts FAIL CLOSED to APPROVAL_REQUIRED.
+
+AUTO = "AUTO"
+APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
+
+# Persisted task-health taxonomy.  These are deliberately separate from the
+# board's workflow statuses: a ``running`` row can be ACTIVE, STALLED, or
+# ORPHANED depending on corroborating run/process/activity evidence.
+ACTIVE = "ACTIVE"
+STALLED = "STALLED"
+ORPHANED = "ORPHANED"
+FAILED = "FAILED"
+COMPLETED_UNHANDED = "COMPLETED_UNHANDED"
+DEPENDENCY_DEADLOCK = "DEPENDENCY_DEADLOCK"
+INVALID_SUPERSEDED_DEPENDENCY = "INVALID_SUPERSEDED_DEPENDENCY"
+APPROVAL_BLOCKED = "APPROVAL_BLOCKED"
+STATE_INCONSISTENCY = "STATE_INCONSISTENCY"
+
+ACTION_STATUS_STARTING = "STARTING"
+ACTION_STATUS_EXECUTED = "EXECUTED"
+ACTION_STATUS_RUNNING = "RUNNING"
+ACTION_STATUS_RECOVERING = "RECOVERING"
+ACTION_STATUS_AWAITING_APPROVAL = "AWAITING_APPROVAL"
+ACTION_STATUS_BLOCKED = "BLOCKED"
+ACTION_STATUS_COMPLETED = "COMPLETED"
+ACTION_STATUS_FAILED = "FAILED"
+
+AUTO_CONTINUE_EVENT_KIND = "auto_continue"
+RECOVERY_EVENT_KIND = "auto_recovery"
+
+AUTONOMY_MODE_AUTO = "auto"
+AUTONOMY_MODE_CHECKPOINT = "checkpoint"
+
+DEFAULT_AUTONOMY_POLICY: dict = {
+    "mode": AUTONOMY_MODE_AUTO,      # advance through low-risk workflow
+    "approvals": {},                  # {"ACTION_TYPE": "auto"|"required"}
+    "protectedBranches": [],          # extra canonical branches beyond main/master
+}
+CANONICAL_BRANCH_NAMES = ("main", "master")
+
+# Resolver + orchestrator action identities that are internal to the current
+# mission, reversible, non-destructive, and inside already-approved scope
+# (Hermes autonomy policy, spec §3 defaults).
+_AUTO_ACTION_TYPES = frozenset({
+    "REMEDIATION",
+    "AWAITING_WORKERS",
+    "RE_RUN_SECURITY_REVIEW",
+    "RE_RUN_DEVOPS_REVIEW",
+    "RE_RUN_QA",
+    "RE_RUN_FINAL_GATE",
+    "RE_RUN_REVIEW",
+    "RE_RUN_GATE",
+    "RUN_TESTS",
+    "TESTS",
+    "AUDIT",
+    "BROWSER_VERIFICATION",
+    "KANBAN_CARD_CREATE",
+    "KANBAN_CARD_UPDATE",
+    "CREATE_FEATURE_BRANCH",
+    "BRANCH_COMMIT",
+    "DOCUMENTATION",
+    "WORKER_RETRY",
+    "RECOMPUTE_HANDOFF",
+    "EPHEMERAL_CLEANUP",
+})
+
+# Actions that cross the operator-approval boundary: canonical-state
+# mutation, destructive or irreversible operations, security/product
+# direction changes, external impact, or decisions a model cannot safely
+# make (Hermes autonomy policy, spec §4).
+_APPROVAL_ACTION_TYPES = frozenset({
+    "MERGE_MAIN",
+    "MERGE",
+    "PUSH_MAIN",
+    "FORCE_PUSH",
+    "HISTORY_REWRITE",
+    "DELETE_BRANCH",
+    "DELETE_TAG",
+    "DELETE_KANBAN_EVIDENCE",
+    "DESTRUCTIVE_MIGRATION",
+    "DESTRUCTIVE_DB_MIGRATION",
+    "IRREVERSIBLE_PRODUCTION_OP",
+    "SECURITY_POLICY_CHANGE",
+    "ARCHITECTURE_REDESIGN",
+    "PRODUCT_SCOPE_EXPANSION",
+    "PRODUCT_DIRECTION_CHOICE",
+    "PRODUCTION_DEPLOYMENT",
+    "EXTERNAL_PUBLICATION",
+    "RELEASE",
+    # Resolver outputs that intentionally stop for a human:
+    "AWAITING_DECISION",
+    "CONFIRM_REPO_STATE",
+    "INTEGRATION_REVIEW",  # its milestone is a merge decision on canonical state
+})
+
+# Actions whose approval depends on whether they touch canonical state
+# (branch context required).
+_BRANCH_CONTEXT_ACTION_TYPES = frozenset({
+    "COMMIT", "PUSH", "DELIVERY_CHECKPOINT", "PUSH_CHECKPOINT",
+})
+
+# Legacy ``approvals_policy`` used verb keys (commit/push/merge) while the
+# resolver emits workflow identities (DELIVERY_CHECKPOINT/…). Alias map so a
+# legacy override still reaches the identities it used to gate.
+_LEGACY_VERB_ALIASES = {
+    "COMMIT": ("COMMIT", "BRANCH_COMMIT", "DELIVERY_CHECKPOINT"),
+    "PUSH": ("PUSH", "PUSH_MAIN", "PUSH_CHECKPOINT", "DELIVERY_CHECKPOINT"),
+    "MERGE": ("MERGE", "MERGE_MAIN", "INTEGRATION_REVIEW"),
+}
+
+
+def _branch_is_canonical(branch: Optional[str], policy: dict) -> bool:
+    if not branch:
+        return False
+    protected = set(CANONICAL_BRANCH_NAMES) | set(
+        policy.get("protectedBranches") or []
+    )
+    return branch.strip() in protected
+
+
+def autonomy_policy_from_config(config: Optional[dict]) -> dict:
+    """Normalise the persisted operator autonomy policy (config.yaml).
+
+    Reads ``kanban.autonomy``::
+
+        kanban:
+          autonomy:
+            mode: auto        # auto | checkpoint
+            approvals: {}     # {"ACTION_TYPE": "auto" | "required"}
+            protectedBranches: []
+
+    ``mode: auto`` (default) advances through the most logical low-risk
+    workflow and requests approval only for material/high-impact decisions.
+    ``mode: checkpoint`` requests approval at every gate/transition.
+    ``approvals`` overrides per action identity (highest precedence).
+    Unknown keys / invalid values fall back to defaults — the config is
+    advisory, never load-bearing for safety (unknown actions still fail
+    closed to APPROVAL_REQUIRED).
+    """
+    kanban = config.get("kanban") if isinstance(config, dict) else None
+    raw = kanban.get("autonomy") if isinstance(kanban, dict) else None
+    policy = dict(DEFAULT_AUTONOMY_POLICY)
+    if not isinstance(raw, dict):
+        return policy
+    mode = str(raw.get("mode", AUTONOMY_MODE_AUTO)).strip().lower()
+    if mode in (AUTONOMY_MODE_AUTO, AUTONOMY_MODE_CHECKPOINT):
+        policy["mode"] = mode
+    approvals = raw.get("approvals")
+    if isinstance(approvals, dict):
+        normalized: dict[str, str] = {}
+        for key, value in approvals.items():
+            v = str(value).strip().lower()
+            if v in ("auto", "required"):
+                normalized[str(key)] = v
+        policy["approvals"] = normalized
+    protected = raw.get("protectedBranches")
+    if isinstance(protected, (list, tuple)):
+        policy["protectedBranches"] = [
+            str(b).strip() for b in protected if str(b).strip()
+        ]
+    return policy
+
+
+def classify_next_action(
+    action_type: Optional[str],
+    *,
+    branch: Optional[str] = None,
+    policy: Optional[dict] = None,
+) -> dict:
+    """Classify a resolved next action: ``AUTO`` or ``APPROVAL_REQUIRED``.
+
+    Pure and deterministic. Precedence:
+
+    1. Explicit per-action operator override (``policy['approvals']``).
+    2. ``checkpoint`` mode → everything requires approval.
+    3. Canonical-branch context for branch-sensitive actions (commit/push/
+       delivery/push checkpoint on ``main``/protected branches).
+    4. Hard-coded approval table (merges, force pushes, destructive ops,
+       product/security direction, external impact, ambiguous decisions).
+    5. Hard-coded auto table (internal, reversible, non-destructive work).
+    6. Unknown actions fail closed to APPROVAL_REQUIRED.
+
+    Returns ``{"decisionClass", "requiresApproval", "rationale"}``.
+    """
+    policy = dict(DEFAULT_AUTONOMY_POLICY, **(policy or {}))
+    key = str(action_type or "").strip().upper() or None
+
+    # 1) Explicit operator override — highest precedence.
+    override = (policy.get("approvals") or {}).get(key) if key else None
+    if override == "required":
+        return {
+            "decisionClass": APPROVAL_REQUIRED,
+            "requiresApproval": True,
+            "rationale": f"Operator autonomy override: {key} requires approval.",
+        }
+    if override == "auto":
+        return {
+            "decisionClass": AUTO,
+            "requiresApproval": False,
+            "rationale": f"Operator autonomy override: {key} is auto-approved.",
+        }
+
+    # 2) Checkpoint mode: every transition is surfaced to the operator.
+    if (policy.get("mode") or AUTONOMY_MODE_AUTO) == AUTONOMY_MODE_CHECKPOINT:
+        return {
+            "decisionClass": APPROVAL_REQUIRED,
+            "requiresApproval": True,
+            "rationale": "Operator autonomy policy is checkpoint mode — "
+                         "approval requested at every gate/transition.",
+        }
+
+    if not key:
+        return {
+            "decisionClass": APPROVAL_REQUIRED,
+            "requiresApproval": True,
+            "rationale": "No resolvable action identity — cannot determine "
+                         "safety; approval required.",
+        }
+
+    # 3) Canonical-branch context (branch-sensitive identities).
+    canonical = _branch_is_canonical(branch, policy)
+    if key in _BRANCH_CONTEXT_ACTION_TYPES:
+        if canonical:
+            return {
+                "decisionClass": APPROVAL_REQUIRED,
+                "requiresApproval": True,
+                "rationale": f"{key} would mutate canonical branch state "
+                             f"({branch!r}); approval required.",
+            }
+        if branch:
+            return {
+                "decisionClass": AUTO,
+                "requiresApproval": False,
+                "rationale": f"{key} on feature branch {branch!r} — "
+                             "reversible, non-destructive, within approved scope.",
+            }
+        return {
+            "decisionClass": APPROVAL_REQUIRED,
+            "requiresApproval": True,
+            "rationale": f"{key} without confirmable repository identity — "
+                         "cannot verify it stays off canonical state.",
+        }
+
+    # 4) / 5) Hard tables.
+    if key in _APPROVAL_ACTION_TYPES:
+        return {
+            "decisionClass": APPROVAL_REQUIRED,
+            "requiresApproval": True,
+            "rationale": f"{key} crosses the operator-approval boundary "
+                         "(canonical mutation, destructive/irreversible step, "
+                         "or material decision).",
+        }
+    if key in _AUTO_ACTION_TYPES:
+        return {
+            "decisionClass": AUTO,
+            "requiresApproval": False,
+            "rationale": f"{key} is internal to the current mission, "
+                         "reversible, non-destructive, and within approved scope.",
+        }
+
+    # 6) Fail closed: unknown actions are never silently auto-executed.
+    return {
+        "decisionClass": APPROVAL_REQUIRED,
+        "requiresApproval": True,
+        "rationale": f"{key} is not covered by the autonomy policy and its "
+                     "safety cannot be determined confidently; approval required.",
+    }
+
+
+def resolve_next_action(
+    snapshot: dict,
+    *,
+    approvals_policy: Optional[dict] = None,
+    autonomy_policy: Optional[dict] = None,
+) -> dict:
+    """Resolve the recommended next workflow from a synthesized snapshot.
+
+    Pure + generic (no product-specific logic). Inputs are persisted facts:
+    gate verdict, active workers, blockers, repo state. Output is a
+    structured decision::
+
+        {"type": str, "requiresApproval": bool, "reason": str,
+         "sequence": [str, ...],
+         "decisionClass": "AUTO"|"APPROVAL_REQUIRED", "rationale": str}
+
+    ``decisionClass`` is explicit policy, never prose. ``approvals_policy``
+    is accepted for back-compat and merged as per-action ``approvals``
+    overrides (e.g. ``{"commit": "required"}``). ``autonomy_policy`` is the
+    persisted operator policy (see :func:`autonomy_policy_from_config`);
+    defaults to the built-in auto policy.
+
+    Nothing here performs an action — it only decides, so authorization
+    boundaries are respected by construction. When the decision class is
+    APPROVAL_REQUIRED the caller surfaces "awaiting your approval"; when
+    AUTO the caller executes/starts the resolved workflow without asking.
+    """
+    policy = dict(DEFAULT_AUTONOMY_POLICY)
+    if autonomy_policy:
+        policy.update(autonomy_policy)
+    if approvals_policy:
+        # Legacy {verb: bool} shape: True -> required, False -> auto,
+        # expanded onto the resolver action identities the verb used to gate.
+        merged = dict(policy.get("approvals") or {})
+        required_aliases: set[str] = set()
+        auto_aliases: set[str] = set()
+        for key, value in approvals_policy.items():
+            aliases = _LEGACY_VERB_ALIASES.get(
+                str(key).strip().upper(), (str(key).strip().upper(),)
+            )
+            if value is True:
+                required_aliases.update(aliases)
+            elif value is False:
+                auto_aliases.update(aliases)
+        for alias in sorted(required_aliases):
+            merged[alias] = "required"
+        # Auto only wins when no other contributing verb forces approval.
+        for alias in sorted(auto_aliases):
+            if alias not in required_aliases:
+                merged[alias] = "auto"
+        policy["approvals"] = merged
+
+    blockers = [b for b in (snapshot.get("blockers") or []) if b]
+    active = [w for w in (snapshot.get("active_workers") or []) if w]
+    repo = snapshot.get("repo_state") or {}
+    verdict = snapshot.get("verdict")
+    branch = repo.get("branch")
+
+    if blockers:
+        action_type = "AWAITING_DECISION"
+        return {
+            "type": action_type,
+            "requiresApproval": True,
+            "reason": f"Unresolved blocker(s): {', '.join(blockers)} — human decision required.",
+            "sequence": ["Resolve blockers", "Re-run the affected reviews", "Re-run the final gate"],
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
+        }
+    if active:
+        action_type = "AWAITING_WORKERS"
+        return {
+            "type": action_type,
+            "requiresApproval": False,
+            "reason": f"Active worker(s) still running: {', '.join(active)}.",
+            "sequence": ["Wait for active workers", "Confirm gate verdict"],
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
+        }
+    if verdict is False:
+        action_type = "REMEDIATION"
+        return {
+            "type": action_type,
+            "requiresApproval": False,
+            "reason": "Final gate rejected — remediation required before any delivery.",
+            "sequence": ["Route remediation to the implementer", "Security/DevOps re-review", "Independent QA re-review", "Re-run the final gate"],
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
+        }
+    if verdict is not True:
+        action_type = "AWAITING_DECISION"
+        return {
+            "type": action_type,
+            "requiresApproval": True,
+            "reason": "Gate completed without an explicit ACCEPT verdict — confirm before proceeding.",
+            "sequence": ["Inspect gate run summary", "Confirm accept/reject"],
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
+        }
+
+    # Accepted. Recommend the legitimate next workflow from repo state.
+    dirty = bool(repo.get("dirty"))
+    committed = bool(repo.get("committed"))
+    pushed = bool(repo.get("pushed"))
+
+    if dirty:
+        action_type = "DELIVERY_CHECKPOINT"
+        return {
+            "type": action_type,
+            "requiresApproval": classify_next_action(
+                action_type, branch=branch, policy=policy
+            )["requiresApproval"],
+            "reason": "Final gate accepted; candidate remains uncommitted.",
+            "sequence": [
+                "Verify accepted manifest has not drifted",
+                "Stage the accepted candidate",
+                "Run delivery Git/QA review",
+                "Commit the accepted checkpoint",
+                "Push the feature branch",
+                "Do not merge without separate authorization",
+            ],
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
+        }
+    if committed and not pushed:
+        action_type = "PUSH_CHECKPOINT"
+        return {
+            "type": action_type,
+            "requiresApproval": classify_next_action(
+                action_type, branch=branch, policy=policy
+            )["requiresApproval"],
+            "reason": "Final gate accepted and committed; branch not yet pushed.",
+            "sequence": [
+                "Push the current feature branch",
+                "Verify local == remote SHA",
+                "Do not merge without separate authorization",
+            ],
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
+        }
+    if committed and pushed:
+        action_type = "INTEGRATION_REVIEW"
+        return {
+            "type": action_type,
+            "requiresApproval": True,
+            "reason": "Accepted and pushed — integration/review is next; the merge "
+                      "decision itself requires operator approval.",
+            "sequence": [
+                "Integration review",
+                "Merge decision (requires approval)",
+                "Close the mission",
+            ],
+            "nextAction": action_type,
+            "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+            "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
+        }
+    # No repo facts (scratch workspace / not a git repo).
+    action_type = "CONFIRM_REPO_STATE"
+    return {
+        "type": action_type,
+        "requiresApproval": True,
+        "reason": "Accepted mission with no repository facts — confirm delivery state before proposing a workflow.",
+        "sequence": ["Confirm repository state", "Decide delivery or closure"],
+        "nextAction": action_type,
+        "decisionClass": classify_next_action(action_type, branch=branch, policy=policy)["decisionClass"],
+        "rationale": classify_next_action(action_type, branch=branch, policy=policy)["rationale"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -8558,22 +10163,341 @@ def enforce_max_runtime(
 _STALE_HEARTBEAT_GAP_SECONDS = 3600
 
 
+def _dependency_cycle_present(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return whether persisted parent links contain a cycle through task_id."""
+    seen: set[str] = set()
+    stack = list(parent_ids(conn, task_id))
+    while stack:
+        current = stack.pop()
+        if current == task_id:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        stack.extend(parent_ids(conn, current))
+    return False
+
+
+def _latest_handoff_payload(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, HANDOFF_EVENT_KIND),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def task_recovery_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    now: Optional[int] = None,
+) -> dict:
+    """Collect bounded, persisted evidence used by the recovery classifier.
+
+    The collector does not mutate the board.  It intentionally keeps raw prose
+    out of the decision surface: summaries and redacted output are history, not
+    predicates.  Liveness, run state, heartbeats, activity timestamps,
+    dependency state, Git facts and structured handoff/nextAction data are
+    returned separately so callers can audit exactly why a classification was
+    made.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"unknown task {task_id}")
+    now_i = int(time.time()) if now is None else int(now)
+    # The active run id is authoritative even when clock skew or test fixtures
+    # make an older closed run's ``started_at`` sort later.
+    run = (
+        get_run(conn, task.current_run_id)
+        if task.current_run_id is not None
+        else latest_run(conn, task_id)
+    )
+    latest_event = conn.execute(
+        "SELECT kind, created_at FROM task_events WHERE task_id = ? "
+        "AND kind IN ('activity', 'progress', 'tool_progress') "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    activity_candidates = [
+        int(value) for value in (
+            task.last_heartbeat_at,
+            latest_event["created_at"] if latest_event else None,
+        ) if value is not None
+    ]
+    repo = repo_state_for(task)
+    if repo.get("last_commit_at") is not None:
+        activity_candidates.append(int(repo["last_commit_at"]))
+
+    target = find_mission_parent(conn, task_id) if task.role == "gate" else None
+    handoff_target = target.id if target is not None else task_id
+    handoff = _latest_handoff_payload(conn, handoff_target)
+    decision = handoff.get("decision") if isinstance(handoff, dict) else None
+    next_action = handoff.get("next_action") if isinstance(handoff, dict) else None
+    parents = task_graph_context(conn, task_id)["parents"]
+    worker_alive: Optional[bool] = None
+    if task.worker_pid:
+        worker_alive = _pid_alive(task.worker_pid)
+
+    return {
+        "taskId": task.id,
+        "status": task.status,
+        "role": task.role,
+        "blockKind": task.block_kind,
+        "claimLock": task.claim_lock,
+        "claimExpires": task.claim_expires,
+        "workerPid": task.worker_pid,
+        "workerAlive": worker_alive,
+        "currentRunId": task.current_run_id,
+        "runId": run.id if run is not None else None,
+        "runStatus": run.status if run is not None else None,
+        "runOutcome": run.outcome if run is not None else None,
+        "runStartedAt": run.started_at if run is not None else task.started_at,
+        "lastHeartbeatAt": task.last_heartbeat_at,
+        "lastActivityAt": max(activity_candidates) if activity_candidates else None,
+        "latestEventKind": latest_event["kind"] if latest_event else None,
+        "parentStatuses": [p["status"] for p in parents],
+        "dependencyCycle": _dependency_cycle_present(conn, task_id),
+        "consecutiveFailures": int(task.consecutive_failures or 0),
+        "maxRetries": task.max_retries,
+        "handoffPresent": handoff is not None,
+        "decisionClass": (
+            decision.get("decisionClass") if isinstance(decision, dict) else None
+        ),
+        "actionStatus": (
+            decision.get("actionStatus") if isinstance(decision, dict) else None
+        ),
+        "nextAction": (
+            next_action.get("type") if isinstance(next_action, dict) else None
+        ),
+        "repoState": repo,
+        "observedAt": now_i,
+    }
+
+
+def classify_task_health(
+    evidence: dict,
+    *,
+    now: Optional[int] = None,
+    stale_timeout_seconds: int = 0,
+    heartbeat_gap_seconds: int = _STALE_HEARTBEAT_GAP_SECONDS,
+) -> dict:
+    """Classify one task from corroborating evidence, never elapsed time alone.
+
+    Returns a structured classification plus the bounded next recovery action.
+    Missing or contradictory material evidence fails closed to
+    ``STATE_INCONSISTENCY / APPROVAL_REQUIRED``.  ``ACTIVE`` is the safe
+    default when remote process liveness cannot be established: the watchdog
+    must not kill legitimate long-running work merely because time elapsed.
+    """
+    now_i = int(time.time()) if now is None else int(now)
+
+    def result(
+        classification: str,
+        decision_class: str,
+        next_action: str,
+        reason: str,
+    ) -> dict:
+        heartbeat = evidence.get("lastHeartbeatAt")
+        activity = evidence.get("lastActivityAt")
+        fresh_heartbeat = (
+            heartbeat is not None
+            and now_i - int(heartbeat) < heartbeat_gap_seconds
+        )
+        fresh_activity = (
+            activity is not None
+            and now_i - int(activity) < heartbeat_gap_seconds
+        )
+        observed_running = (
+            evidence.get("status") == "running"
+            and evidence.get("currentRunId") is not None
+            and (
+                evidence.get("workerAlive") is True
+                or fresh_heartbeat
+                or fresh_activity
+            )
+        )
+        if decision_class == APPROVAL_REQUIRED:
+            observable_status = ACTION_STATUS_AWAITING_APPROVAL
+        elif observed_running and classification == ACTIVE:
+            observable_status = ACTION_STATUS_RUNNING
+        elif classification == FAILED:
+            observable_status = ACTION_STATUS_FAILED
+        elif classification == ACTIVE and evidence.get("status") == "done":
+            observable_status = ACTION_STATUS_COMPLETED
+        else:
+            observable_status = ACTION_STATUS_STARTING
+        owner_action = "REQUIRED" if decision_class == APPROVAL_REQUIRED else "NONE"
+        running_evidence = (
+            {
+                "workerPid": evidence.get("workerPid"),
+                "runId": evidence.get("currentRunId"),
+                "lastHeartbeat": heartbeat,
+                "lastActivity": activity,
+                "currentTask": evidence.get("taskId"),
+            }
+            if observable_status == ACTION_STATUS_RUNNING
+            else None
+        )
+        return {
+            "classification": classification,
+            "decisionClass": decision_class,
+            "requiresApproval": decision_class == APPROVAL_REQUIRED,
+            "nextAction": next_action,
+            "reason": reason,
+            "lastActivity": activity,
+            "actionStatus": observable_status,
+            "ownerAction": owner_action,
+            "requiredAction": next_action if owner_action == "REQUIRED" else None,
+            "why": reason,
+            "runningEvidence": running_evidence,
+        }
+
+    status = evidence.get("status")
+    run_status = evidence.get("runStatus")
+    current_run_id = evidence.get("currentRunId")
+    decision_class = evidence.get("decisionClass")
+    action_status = evidence.get("actionStatus")
+
+    contradictory_decision = (
+        decision_class == APPROVAL_REQUIRED
+        and action_status in {ACTION_STATUS_STARTING, ACTION_STATUS_EXECUTED}
+    ) or (
+        decision_class == AUTO and action_status == ACTION_STATUS_AWAITING_APPROVAL
+    )
+    contradictory_run = (
+        status == "running"
+        and current_run_id is not None
+        and (
+            evidence.get("runId") != current_run_id
+            or run_status != "running"
+        )
+    ) or (status != "running" and current_run_id is not None)
+    if contradictory_decision or contradictory_run:
+        return result(
+            STATE_INCONSISTENCY,
+            APPROVAL_REQUIRED,
+            "CONFIRM_PERSISTED_STATE",
+            "Persisted run or nextAction evidence is contradictory; no automatic mutation is safe.",
+        )
+
+    if status == "done" and evidence.get("role") == "gate" and not evidence.get("handoffPresent"):
+        return result(
+            COMPLETED_UNHANDED,
+            AUTO,
+            "RECOMPUTE_HANDOFF",
+            "The final gate completed but has no persisted terminal handoff.",
+        )
+
+    if status == "blocked":
+        parent_statuses = evidence.get("parentStatuses") or []
+        if evidence.get("dependencyCycle") or (
+            evidence.get("blockKind") == "dependency"
+            and parent_statuses
+            and all(p == "blocked" for p in parent_statuses)
+        ):
+            return result(
+                DEPENDENCY_DEADLOCK,
+                APPROVAL_REQUIRED,
+                "RECONCILE_DEPENDENCY",
+                "Dependencies cannot advance and no directly proven reversible edge was supplied.",
+            )
+        return result(
+            APPROVAL_BLOCKED,
+            APPROVAL_REQUIRED,
+            "AWAITING_DECISION",
+            "The task carries a persisted block and requires an explicit owner decision.",
+        )
+
+    latest_outcome = str(evidence.get("runOutcome") or "").lower()
+    if status in {"ready", "review", "todo"} and latest_outcome in {
+        "failed", "crashed", "timed_out", "spawn_failed",
+    }:
+        limit = evidence.get("maxRetries")
+        failures = int(evidence.get("consecutiveFailures") or 0)
+        if limit is not None and failures >= int(limit):
+            return result(
+                APPROVAL_BLOCKED,
+                APPROVAL_REQUIRED,
+                "AWAITING_DECISION",
+                "The bounded retry budget is exhausted.",
+            )
+        return result(
+            FAILED,
+            AUTO,
+            "WORKER_RETRY",
+            "The latest run failed and the bounded retry path remains available.",
+        )
+
+    if status == "running":
+        worker_alive = evidence.get("workerAlive")
+        broken_claim = not evidence.get("claimLock") or evidence.get("claimExpires") is None
+        if worker_alive is False:
+            return result(
+                ORPHANED,
+                AUTO,
+                "WORKER_RETRY",
+                "The persisted worker process is no longer alive.",
+            )
+        if broken_claim and worker_alive is not True:
+            return result(
+                ORPHANED,
+                AUTO,
+                "WORKER_RETRY",
+                "The running task has no valid claim and no live worker evidence.",
+            )
+
+        started = evidence.get("runStartedAt")
+        elapsed = now_i - int(started) if started is not None else 0
+        heartbeat = evidence.get("lastHeartbeatAt")
+        heartbeat_age = now_i - int(heartbeat) if heartbeat is not None else None
+        activity = evidence.get("lastActivityAt")
+        activity_age = now_i - int(activity) if activity is not None else None
+        old_enough = stale_timeout_seconds > 0 and elapsed >= stale_timeout_seconds
+        heartbeat_stale = heartbeat_age is None or heartbeat_age >= heartbeat_gap_seconds
+        activity_stale = activity_age is None or activity_age >= heartbeat_gap_seconds
+        if old_enough and heartbeat_stale and activity_stale:
+            return result(
+                STALLED,
+                AUTO,
+                "WORKER_RETRY",
+                "Elapsed time is corroborated by stale heartbeat, stale activity, and absent process progress.",
+            )
+
+    return result(
+        ACTIVE,
+        AUTO,
+        evidence.get("nextAction") or "AWAITING_WORKERS",
+        "Persisted workflow evidence is consistent; no recovery mutation is required.",
+    )
+
+
 def detect_stale_running(
     conn: sqlite3.Connection,
     *,
     stale_timeout_seconds: int = 0,
     signal_fn=None,
 ) -> list[str]:
-    """Reclaim ``running`` tasks that show no progress (heartbeat) within the
-    staleness window.
+    """Reclaim ``running`` tasks whose lack of progress is corroborated.
 
-    A task is considered stale when BOTH of these hold:
+    A task is considered stale when all of these hold:
 
     1. It has been running for longer than ``stale_timeout_seconds``
        (measured from the active run's ``started_at``, falling back to
        ``tasks.started_at`` on older runs).
     2. Its ``last_heartbeat_at`` is older than
        ``_STALE_HEARTBEAT_GAP_SECONDS`` (or NULL — never sent a heartbeat).
+    3. No recent persisted activity or Git commit corroborates progress.
+    4. Current run/claim/process evidence is internally consistent with a
+       stalled run. Dead workers are handled separately as ``ORPHANED``.
 
     On reclaim the task is restored to its source phase, the run is closed with
     ``outcome='stale'``, and the host-local worker (if still running) is
@@ -8619,6 +10543,19 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
+        # Elapsed time + an absent heartbeat is suspicion, not proof.  Fold in
+        # independent persisted activity and process/run evidence before the
+        # watchdog mutates anything.  This is the same reusable classifier
+        # exposed to diagnostics and Mission Control projections.
+        evidence = task_recovery_evidence(conn, tid, now=now)
+        health = classify_task_health(
+            evidence,
+            now=now,
+            stale_timeout_seconds=stale_timeout_seconds,
+        )
+        if health["classification"] != STALLED:
+            continue
+
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
@@ -8647,6 +10584,16 @@ def detect_stale_running(
                 continue
 
             payload = {
+                "healthClassification": STALLED,
+                "decisionClass": AUTO,
+                "actionStatus": ACTION_STATUS_RECOVERING,
+                "ownerAction": "NONE",
+                "nextAction": "WORKER_RETRY",
+                "lastActivity": health.get("lastActivity"),
+                "operatorMessage": (
+                    "RÉCUPÉRATION AUTO — stall corroboré; nouvelle tentative "
+                    "planifiée, aucune action opérateur requise."
+                ),
                 "elapsed_seconds": int(elapsed),
                 "last_heartbeat_at": (
                     int(last_hb) if last_hb is not None else None
@@ -8743,6 +10690,15 @@ def reconcile_orphaned_running(
                 continue
             payload = {
                 "reason": "orphaned_running",
+                "healthClassification": ORPHANED,
+                "decisionClass": AUTO,
+                "actionStatus": ACTION_STATUS_RECOVERING,
+                "ownerAction": "NONE",
+                "nextAction": "WORKER_RETRY",
+                "operatorMessage": (
+                    "RÉCUPÉRATION AUTO — worker orphelin récupéré; "
+                    "nouvelle tentative planifiée, aucune action opérateur requise."
+                ),
                 "claim_lock": row["claim_lock"],
                 "claim_expires": (
                     int(row["claim_expires"])
@@ -8990,6 +10946,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
+            if event_kind == "crashed":
+                event_payload.update({
+                    "healthClassification": ORPHANED,
+                    "decisionClass": AUTO,
+                    "actionStatus": ACTION_STATUS_RECOVERING,
+                    "ownerAction": "NONE",
+                    "nextAction": "WORKER_RETRY",
+                    "operatorMessage": (
+                        "RÉCUPÉRATION AUTO — worker disparu récupéré; nouvelle "
+                        "tentative planifiée, aucune action opérateur requise."
+                    ),
+                })
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "

@@ -4089,6 +4089,63 @@ describe('openNewSessionTile workspace target', () => {
 
     expect(createParams).not.toHaveProperty('cwd')
   })
+
+  it('records the profile-door owner for an unlisted project/branch new-session tile (Mission Control regression)', async () => {
+    // Reproduces: project/branch "+ New session" while the main chat is
+    // occupied → openNewSessionTile(listed:false) on a local profile-door
+    // secondary (hotelos-cdp, NO registry connection route). The fresh
+    // session has no DB row until its first prompt, so without an owner
+    // record every pre-row session-scoped RPC failed closed with
+    // "Session owner could not be resolved".
+    $activeGatewayProfile.set('hotelos-cdp')
+    $newChatProfile.set('hotelos-cdp')
+    $projectScope.set('p_hotelos')
+    $projectTree.set([
+      {
+        id: 'p_hotelos',
+        label: 'HotelOS',
+        path: '/Users/thomas/Developer/hotelos',
+        repos: [],
+        sessionCount: 0
+      } as never
+    ])
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.create') {
+        return {
+          info: { cwd: '/Users/thomas/Developer/hotelos', model: 'test-model', tools: {}, skills: {} },
+          session_id: 'rt-door-tile-1',
+          stored_session_id: 'stored-door-tile-1'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    // Ensure the store module (not the actions import) exposes the hint.
+    const sessionStore = await import('@/store/session')
+
+    await act(async () => {
+      await handle!.openNewSessionTile('center', { cwd: '/Users/thomas/Developer/hotelos', listed: false })
+    })
+
+    expect(sessionStore.getSessionOwnerHint('stored-door-tile-1')).toMatchObject({
+      connectionId: '',
+      profile: 'hotelos-cdp'
+    })
+    expect(sessionStore.knownSessionOwner(sessionStore.ownerLookupSessionRows(), 'stored-door-tile-1')).toBe(
+      'hotelos-cdp'
+    )
+
+    // Cleanup: the tile atoms / project scope must not leak into later tests.
+    $sessionTiles.set([])
+    $newChatProfile.set(null)
+    $activeGatewayProfile.set('default')
+  })
 })
 describe('selectSidebarItem', () => {
   it('fronts the workspace pane when navigating to a sidebar route (issue #72602)', async () => {

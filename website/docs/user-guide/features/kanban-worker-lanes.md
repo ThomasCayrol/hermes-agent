@@ -110,6 +110,43 @@ So lane authors don't have to reimplement these:
 - **Stranded-task detection** — a ready task whose assignee never produces a claim within `kanban.stranded_threshold_seconds` (default 30 min) shows up in `hermes kanban diagnostics` as a `stranded_in_ready` warning. Severity escalates to error at 2x the threshold and critical at 6x. Catches typo'd assignees, deleted profiles, and down external worker pools in one signal — identity-agnostic, no per-board allowlist to curate.
 - **Legacy review dependency deadlock** — a parent sticky-blocked with `review-required:` while one or more direct children remain dependency-gated in `todo` produces an immediate `review_dependency_deadlock` error. The diagnostic is read-only: it suggests completing the finished phase or unlinking the incorrect edge but never removes a user block automatically.
 
+### Evidence-based stall recovery
+
+The watchdog does not classify work as stalled from elapsed time alone. It
+collects the current run, claim, worker-process liveness, heartbeat, persisted
+activity, dependency graph, structured `nextAction`/handoff state, and Git
+activity for repository workspaces. A live worker or recent persisted progress
+keeps the task active even when a duration threshold has elapsed. Contradictory
+state fails closed as `STATE_INCONSISTENCY` with `APPROVAL_REQUIRED`.
+
+Safe automatic recovery is bounded and audited. Dead workers and corroborated
+stalls use the existing retry/reclaim lifecycle; missing terminal handoffs are
+recomputed through the existing handoff path. Recovery events persist the
+classification, decision class, action status, last activity, and next action,
+so read-only dashboards project kernel decisions rather than inventing their
+own timer.
+
+Operator handoffs separate policy from observable execution. `AUTO` means an
+action is authorized; it does not mean a worker is running. Handoffs therefore
+persist and render `OWNER ACTION: NONE|REQUIRED` plus one of the observable
+`ACTION STATUS` values `STARTING`, `RUNNING`, `RECOVERING`,
+`AWAITING_APPROVAL`, `BLOCKED`, `COMPLETED`, or `FAILED`. `RUNNING` requires
+live run evidence (current task/run, worker identity, and fresh heartbeat or
+activity), which is included in long-running handoffs. `OWNER ACTION:
+REQUIRED` is immediately followed by the required action and its reason.
+
+Dependency reconciliation is narrower still. Redacted output (including `***`
+placeholders) is never treated as proof. An automatic unlink/archive operation
+requires direct, structured checkout predicates proving each exact edge invalid
+and its parent card superseded. This is classified as
+`INVALID_SUPERSEDED_DEPENDENCY`, not `DEPENDENCY_DEADLOCK`. The kernel then
+deletes only those reversible edges, archives the explicitly proven cards
+without deleting workspaces, runs, comments, or events, reopens the existing
+final gate for a fresh run, recomputes
+dependents, and reads the result back. A content fingerprint makes replay
+idempotent. Missing, ambiguous, stale, or contradictory proof produces
+`STATE_INCONSISTENCY / APPROVAL_REQUIRED` and no mutation.
+
 ## Related
 
 - [Kanban overview](./kanban) — the user-facing intro.

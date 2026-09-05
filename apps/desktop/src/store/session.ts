@@ -197,6 +197,27 @@ export function knownSessionOwner(sessions: readonly SessionInfo[], sessionId: n
     return { connectionId, profile: profile || 'default' }
   }
 
+  const profileOnlyHint = hint && !hint.connectionId.trim()
+
+  // A profile-only hint (recorded when a profile-door secondary minted the
+  // session with no registry connection to tag) is a valid BARE-PROFILE owner:
+  // requestGatewayForProfile dials the same door. Rows take precedence when
+  // they carry a DIFFERENT profile; a same-profile row and a same-profile
+  // hint name the same door, so either resolves identically.
+  if (profileOnlyHint) {
+    const hintProfile = hint.profile.trim() || 'default'
+
+    if (!profile) {
+      return hintProfile === 'default' ? undefined : hintProfile
+    }
+
+    if (profile === hintProfile) {
+      return hintProfile
+    }
+
+    return profile
+  }
+
   const hintProfiles = new Set([hint?.profile.trim() || 'default', hint?.targetProfile?.trim() || 'default'])
 
   if (hint && (!profile || hintProfiles.has(profile || 'default'))) {
@@ -896,7 +917,19 @@ function rememberSessionOwnerHint(sessionId: string, route: SessionOwnerRoute): 
   const id = sessionId.trim()
   const normalized = normalizeOwnerRoute(route)
 
-  if (!id || !normalized.connectionId) {
+  if (!id) {
+    return false
+  }
+
+  // A profile-only hint (no connectionId) is valid when it names a non-default
+  // profile: the profile-door secondary that mints such a session has no
+  // registry identity, but the bare profile IS its owner — requestGatewayForProfile
+  // dials exactly that door. Only the default profile is ambiguous (it may be
+  // served by the primary on any source), so that case still refuses to record.
+  // (`normalizeOwnerRoute` above already trimmed and defaulted empty to "default".)
+  const profileOnly = !normalized.connectionId && normalized.profile !== 'default'
+
+  if (!profileOnly && !normalized.connectionId) {
     return false
   }
 
