@@ -1600,6 +1600,22 @@ class GatewayKanbanWatchersMixin:
                         "kanban dispatcher: terminal-handoff scan failed on board %s",
                         slug,
                     )
+                # Terminal-handoff watchdog: correct persisted STARTING
+                # auto-continuations that never gained a live execution
+                # run/witness/heartbeat (bounded + idempotent). Best-effort —
+                # a watchdog failure must not break dispatch.
+                try:
+                    corrected = _kb.watchdog_terminal_handoffs(conn, board=slug)
+                    if corrected:
+                        logger.info(
+                            "kanban dispatcher: watchdog corrected stuck STARTING handoff(s) %s on board %s",
+                            ",".join(corrected), slug,
+                        )
+                except Exception:
+                    logger.exception(
+                        "kanban dispatcher: terminal-handoff watchdog failed on board %s",
+                        slug,
+                    )
                 return result
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

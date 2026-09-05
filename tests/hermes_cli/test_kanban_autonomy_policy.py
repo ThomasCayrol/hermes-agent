@@ -91,6 +91,27 @@ def _newest_handoff(conn, task_id) -> dict:
     return events[-1]
 
 
+def _executor_witness(conn):
+    """Claim a real executor card -> execution witness.
+
+    AUTO continuations are only persisted when the caller supplies a REAL
+    materialization record: the task_runs row an executor's claim created.
+    The card is deliberately NOT linked under the mission umbrella so the
+    in-flight executor does not show up as an active mission worker.
+    Returns ``{"source": "task_run", "run_id": ...}`` referencing that row.
+    """
+    child = kb.create_task(
+        conn, title="Auto executor", assignee="tester",
+    )
+    claimed = kb.claim_task(conn, child, claimer="test")
+    if claimed is None:
+        ok, why = kb.promote_task(conn, child, actor="test")
+        assert ok, why
+        claimed = kb.claim_task(conn, child, claimer="test")
+    assert claimed is not None and claimed.current_run_id is not None
+    return {"source": "task_run", "run_id": int(claimed.current_run_id)}
+
+
 # ---------------------------------------------------------------------------
 # Verdict derivation precedence (spec §1 + scenario J)
 # ---------------------------------------------------------------------------
@@ -450,13 +471,83 @@ def test_resolve_next_action_accepts_legacy_approvals_policy():
 
 
 # ---------------------------------------------------------------------------
+# Repository policy wins over autonomy (2026-09-04 git-truth delivery)
+# ---------------------------------------------------------------------------
+# A repository that forbids commit/push without owner approval expresses that
+# through the operator policy's per-action approvals using the natural verb
+# keys (commit/push/merge). Those verb keys gate the workflow identities they
+# alias (DELIVERY_CHECKPOINT / COMMIT / PUSH / ...) EVEN on a feature branch:
+# policy wins over the branch-context AUTO default.
+
+
+def test_repo_policy_commit_push_required_beats_feature_branch_auto():
+    """{commit: required, push: required} on a dirty feature branch ->
+    DELIVERY_CHECKPOINT APPROVAL_REQUIRED, never AUTO."""
+    action = kb.resolve_next_action({
+        "verdict": True, "active_workers": [], "blockers": [],
+        "repo_state": {"dirty": True, "committed": False, "pushed": False,
+                       "branch": "feat/x"},
+    }, autonomy_policy={"approvals": {"commit": "required", "push": "required"}})
+    assert action["type"] == "DELIVERY_CHECKPOINT"
+    assert action["decisionClass"] == kb.APPROVAL_REQUIRED
+    assert action["requiresApproval"] is True
+
+
+def test_classify_repo_policy_commit_required_gates_checkpoint_on_feature_branch():
+    """classify consults the legacy verb aliases: commit: required forces
+    DELIVERY_CHECKPOINT approval even where branch context would say AUTO."""
+    out = kb.classify_next_action(
+        "DELIVERY_CHECKPOINT", branch="feat/x",
+        policy={"approvals": {"commit": "required"}},
+    )
+    assert out["decisionClass"] == kb.APPROVAL_REQUIRED
+
+    push_only = kb.classify_next_action(
+        "DELIVERY_CHECKPOINT", branch="feat/x",
+        policy={"approvals": {"push": "required"}},
+    )
+    assert push_only["decisionClass"] == kb.APPROVAL_REQUIRED
+
+    # Explicit identity override still beats the legacy verb group.
+    waiver = kb.classify_next_action(
+        "DELIVERY_CHECKPOINT", branch="feat/x",
+        policy={"approvals": {"commit": "required", "DELIVERY_CHECKPOINT": "auto"}},
+    )
+    assert waiver["decisionClass"] == kb.AUTO
+
+    # commit auto + push required -> the checkpoint (which pushes) stays gated.
+    push_gated = kb.classify_next_action(
+        "DELIVERY_CHECKPOINT", branch="feat/x",
+        policy={"approvals": {"commit": "auto", "push": "required"}},
+    )
+    assert push_gated["decisionClass"] == kb.APPROVAL_REQUIRED
+
+
+def test_repo_policy_verb_keys_apply_to_pure_commit_and_push():
+    assert kb.classify_next_action(
+        "COMMIT", branch="feat/x",
+        policy={"approvals": {"commit": "required"}},
+    )["decisionClass"] == kb.APPROVAL_REQUIRED
+    assert kb.classify_next_action(
+        "PUSH", branch="feat/x",
+        policy={"approvals": {"push": "required"}},
+    )["decisionClass"] == kb.APPROVAL_REQUIRED
+    assert kb.classify_next_action(
+        "MERGE_MAIN", branch="feat/x",
+        policy={"approvals": {"commit": "required"}},
+    )["decisionClass"] == kb.APPROVAL_REQUIRED  # merge table unchanged
+
+
+# ---------------------------------------------------------------------------
 # Terminal-handoff decision block + auto-continuation (spec §6–§7)
 # ---------------------------------------------------------------------------
 
 
 def test_handoff_rejected_gate_records_auto_remediation_and_continue(conn):
-    """Gate REJECTED -> REMEDIATION AUTO: the handoff comment + event carry
-    the decision block, action status STARTING, and an auto_continue event."""
+    """Gate REJECTED -> REMEDIATION AUTO: with a real execution witness the
+    handoff comment + event carry the decision block, action status STARTING,
+    and an auto_continue event referencing the witnessed run. Without a
+    witness the handoff fails closed (see terminal-handoff suite)."""
     umbrella, gate = _run_gate_mission(
         conn,
         result="REJECT",
@@ -464,7 +555,10 @@ def test_handoff_rejected_gate_records_auto_remediation_and_continue(conn):
     )
     gate_task = kb.get_task(conn, gate)
     assert gate_task is not None
-    assert kb.emit_terminal_handoff(conn, gate_task) is True
+    assert kb.emit_terminal_handoff(
+        conn, gate_task,
+        execution_witness=_executor_witness(conn),
+    ) is True
 
     comments = _handoff_comments(conn, umbrella)
     assert len(comments) == 1
@@ -561,7 +655,10 @@ def test_k_restart_replay_does_not_duplicate_auto_launch(conn):
     )
     gate_task = kb.get_task(conn, gate)
     assert gate_task is not None
-    assert kb.emit_terminal_handoff(conn, gate_task) is True
+    assert kb.emit_terminal_handoff(
+        conn, gate_task,
+        execution_witness=_executor_witness(conn),
+    ) is True
     assert len(_events(conn, umbrella, kb.HANDOFF_EVENT_KIND)) == 1
     assert len(_events(conn, umbrella, kb.AUTO_CONTINUE_EVENT_KIND)) == 1
 
@@ -585,7 +682,12 @@ def test_l_same_next_action_idempotent_across_gateway_restart(conn):
     assert gate_task is not None
 
     with kb.connect() as conn1:
-        assert kb.emit_terminal_handoffs_if_due(conn1) == [gate]
+        gate_task1 = kb.get_task(conn1, gate)
+        assert gate_task1 is not None
+        assert kb.emit_terminal_handoff(
+            conn1, gate_task1,
+            execution_witness=_executor_witness(conn1),
+        ) is True
     with kb.connect() as conn2:
         # Second gateway generation sees no due gates and no new emission.
         assert kb.emit_terminal_handoffs_if_due(conn2) == []
