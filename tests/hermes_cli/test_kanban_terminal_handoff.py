@@ -956,9 +956,18 @@ def test_watchdog_corrects_starting_without_witness_and_is_idempotent(conn):
         verdict_result="REJECT",
         verdict_summary="QA rejected: changes required.",
     )
+    conn.execute(
+        "UPDATE tasks SET assignee = 'hotelos-lead' WHERE id = ?", (umbrella,)
+    )
     _plant_legacy_starting_handoff(conn, umbrella, gate)
+    planted_at = conn.execute(
+        "SELECT created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1", (umbrella, kb.HANDOFF_EVENT_KIND)
+    ).fetchone()[0]
 
-    corrected = kb.watchdog_terminal_handoffs(conn)
+    corrected = kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted_at) + 120
+    )
     assert corrected == [umbrella]
 
     bodies = _handoff_comment_bodies(conn, umbrella)
@@ -986,7 +995,9 @@ def test_watchdog_corrects_starting_without_witness_and_is_idempotent(conn):
     assert "Action du propriétaire requise" in payload["discussion"]["action"]
 
     # Idempotent: the same STARTING handoff is never corrected twice.
-    assert kb.watchdog_terminal_handoffs(conn) == []
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted_at) + 240
+    ) == []
     assert len(_watchdog_events(conn, umbrella)) == 1
 
 
@@ -1006,6 +1017,13 @@ def test_watchdog_skips_starting_with_live_execution_witness(conn):
     ) is True
 
     assert kb.watchdog_terminal_handoffs(conn) == []
+    # Even after the full watchdog window, the live executor run is real
+    # materialization: STARTING stays current and is never corrected.
+    import time
+
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(time.time()) + 120
+    ) == []
     assert _watchdog_events(conn, umbrella) == []
     assert len(_handoff_comment_bodies(conn, umbrella)) == 1
 
@@ -1035,14 +1053,18 @@ def test_watchdog_corrects_starting_whose_executor_run_died(conn):
             (int(time.time()), witness["run_id"]),
         )
 
-    corrected = kb.watchdog_terminal_handoffs(conn)
+    corrected = kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(time.time()) + 120
+    )
     assert corrected == [umbrella]
     events = _watchdog_events(conn, umbrella)
     assert len(events) == 1
     payload = json.loads(events[0]["payload"])
     assert payload["reason"]
     assert payload["to"]["decisionClass"] == kb.APPROVAL_REQUIRED
-    assert kb.watchdog_terminal_handoffs(conn) == []
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(time.time()) + 240
+    ) == []
 
 
 # -- reconciliation: derived Git fields / structured truth (2026-09-04) -----
@@ -1610,3 +1632,485 @@ def test_discussion_no_false_archive_when_descendant_runs_cleanly_ended(conn):
     assert snapshot["active_workers"] == []
     assert snapshot["pending_work"] == []
     assert discussion["status"] == kb.DISCUSSION_ARCHIVE_READY
+
+
+# -- terminal probe/test lifecycle cleanup ---------------------------------
+
+
+def test_mission_kind_is_structured_and_validated_at_creation(conn):
+    probe = kb.create_task(
+        conn, title="Synthetic lifecycle fixture", role="umbrella", mission_kind="probe"
+    )
+    test = kb.create_task(
+        conn, title="Synthetic test fixture", role="umbrella", mission_kind="TEST"
+    )
+
+    assert kb.get_task(conn, probe).mission_kind == "probe"
+    assert kb.get_task(conn, test).mission_kind == "test"
+    with pytest.raises(ValueError, match="mission_kind"):
+        kb.create_task(
+            conn, title="Not a probe", role="umbrella", mission_kind="synthetic"
+        )
+
+
+def test_watchdog_waits_full_window_then_reemits_corrected_handoff(conn):
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="REJECT",
+        verdict_summary="QA rejected: changes required.",
+    )
+    conn.execute(
+        "UPDATE tasks SET assignee = 'hotelos-lead' WHERE id = ?", (umbrella,)
+    )
+    _plant_legacy_starting_handoff(conn, umbrella, gate)
+    planted = conn.execute(
+        "SELECT id, created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (umbrella, kb.HANDOFF_EVENT_KIND),
+    ).fetchone()
+
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted["created_at"]) + 119
+    ) == []
+    assert _newest_handoff_event_payload(conn, umbrella)["decision"][
+        "actionStatus"
+    ] == kb.ACTION_STATUS_STARTING
+
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted["created_at"]) + 120
+    ) == [umbrella]
+    corrected = _newest_handoff_event_payload(conn, umbrella)
+    assert corrected["recomputed"] is True
+    assert corrected["recomputed_from_handoff_event_id"] == int(planted["id"])
+    assert corrected["decision"]["decisionClass"] == kb.APPROVAL_REQUIRED
+    assert corrected["decision"]["actionStatus"] == kb.ACTION_STATUS_AWAITING_APPROVAL
+    assert kb.get_task(conn, umbrella).status == "done"
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted["created_at"]) + 240
+    ) == []
+
+
+def test_terminal_probe_auto_archive_preserves_history_and_is_idempotent(conn):
+    umbrella = kb.create_task(
+        conn, title="Synthetic fixture", role="umbrella", mission_kind="probe"
+    )
+    gate = kb.create_task(
+        conn, title="Fixture gate", role="gate", parents=[umbrella]
+    )
+    generic = kb.create_task(
+        conn, title="Corrective remediation", parents=[umbrella]
+    )
+    assert kb.claim_task(conn, umbrella) is not None
+    assert kb.complete_task(conn, umbrella, result="fixture complete")
+    assert kb.claim_task(conn, gate) is not None
+    assert kb.complete_task(conn, gate, result="ACCEPTED", summary="All checks green.")
+    assert kb.claim_task(conn, generic) is not None
+    assert kb.complete_task(conn, generic, result="done")
+    assert kb.emit_terminal_handoffs_if_due(conn) == [gate]
+
+    before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("task_runs", "task_comments", "task_links")
+    }
+    # SEC-PROBE-002: the bounded window now applies whatever the handoff
+    # actionStatus, so the just-emitted handoff must be past the window first.
+    planted_at = _newest_handoff_created_at(conn, umbrella)
+    assert kb.cleanup_terminal_probe_missions(
+        conn, window_seconds=120, now=planted_at + 120
+    ) == [umbrella]
+    assert kb.get_task(conn, umbrella).status == "archived"
+    assert kb.get_task(conn, gate).status == "archived"
+    assert kb.get_task(conn, generic).status == "done"
+    assert conn.execute(
+        "SELECT id FROM tasks WHERE role = 'umbrella' AND status != 'archived' "
+        "AND id = ?", (umbrella,)
+    ).fetchone() is None
+    after = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("task_runs", "task_comments", "task_links")
+    }
+    assert after == before
+    archived_events = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = 'archived' "
+        "AND task_id IN (?, ?)", (umbrella, gate)
+    ).fetchone()[0]
+    assert archived_events == 2
+
+    assert kb.cleanup_terminal_probe_missions(
+        conn, window_seconds=120, now=planted_at + 240
+    ) == []
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = 'archived' "
+        "AND task_id IN (?, ?)", (umbrella, gate)
+    ).fetchone()[0] == archived_events
+
+
+def test_stale_starting_probe_waits_then_archives_in_watchdog_tick(conn):
+    umbrella = kb.create_task(
+        conn, title="Synthetic rejected fixture", role="umbrella", mission_kind="test"
+    )
+    gate = kb.create_task(
+        conn, title="Fixture gate", role="gate", parents=[umbrella]
+    )
+    assert kb.claim_task(conn, umbrella) is not None
+    assert kb.complete_task(conn, umbrella, result="fixture complete")
+    assert kb.claim_task(conn, gate) is not None
+    assert kb.complete_task(
+        conn, gate, result="REJECT", summary="QA rejected: changes required."
+    )
+    _plant_legacy_starting_handoff(conn, umbrella, gate)
+    planted_at = conn.execute(
+        "SELECT created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1", (umbrella, kb.HANDOFF_EVENT_KIND)
+    ).fetchone()[0]
+
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted_at) + 119
+    ) == []
+    assert kb.get_task(conn, umbrella).status == "done"
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted_at) + 120
+    ) == [umbrella]
+    assert kb.get_task(conn, umbrella).status == "archived"
+    assert kb.get_task(conn, gate).status == "archived"
+    lifecycle = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+        (umbrella, kb.TERMINAL_PROBE_CLEANUP_EVENT_KIND),
+    ).fetchall()
+    assert len(lifecycle) == 1
+    assert json.loads(lifecycle[0]["payload"])["classification"] == (
+        kb.DISCUSSION_ARCHIVE_READY
+    )
+    assert _watchdog_events(conn, umbrella) == []
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted_at) + 240
+    ) == []
+
+
+def test_cleanup_never_archives_unproven_legacy_or_real_or_owner_attended_missions(conn):
+    """SEC-PROBE-001 fail-closed: an umbrella mission whose ONLY probe hint is
+    the legacy_derived identity (assignee NULL) is NOT auto-archived when it
+    lacks the stale-STARTING signature, a structured mission_kind, or an
+    ARCHIVE_READY journal — it is indistinguishable from a real mission whose
+    umbrella simply has no assignee yet. Real (assigned) and owner-attended
+    missions stay done too."""
+    # Unproven legacy look-alike: done umbrella, done ACCEPTED gate, NO
+    # assignee, NO stale-STARTING handoff, NO mission_kind. Pre-fix this was
+    # auto-archived immediately (the fail-open Security reproduced).
+    legacy, legacy_gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+
+    real, real_gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", ("hotelos-lead", real))
+
+    attended = kb.create_task(
+        conn, title="Attended fixture", role="umbrella", mission_kind="probe"
+    )
+    attended_gate = kb.create_task(
+        conn, title="Attended gate", role="gate", parents=[attended]
+    )
+    assert kb.claim_task(conn, attended) is not None
+    assert kb.complete_task(conn, attended, result="fixture complete")
+    assert kb.claim_task(conn, attended_gate) is not None
+    assert kb.complete_task(
+        conn, attended_gate, result="ACCEPTED", summary="All checks green."
+    )
+    terminal_at = max(
+        kb.get_task(conn, attended).completed_at,
+        kb.get_task(conn, attended_gate).completed_at,
+    )
+    comment_id = kb.add_comment(
+        conn, attended, "user", "Keep this synthetic mission for manual review."
+    )
+    conn.execute(
+        "UPDATE task_comments SET created_at = ? WHERE id = ?",
+        (int(terminal_at) + 1, comment_id),
+    )
+
+    # All three remain done no matter how far past terminality we scan.
+    assert kb.cleanup_terminal_probe_missions(conn, now=int(terminal_at) + 10_000) == []
+    for tid in (legacy, legacy_gate, real, real_gate, attended, attended_gate):
+        row = kb.get_task(conn, tid)
+        assert row is not None and row.status == "done"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = 'archived' "
+        "AND task_id IN (?, ?, ?, ?, ?, ?)",
+        (legacy, legacy_gate, real, real_gate, attended, attended_gate),
+    ).fetchone()[0] == 0
+
+
+def test_cleanup_never_archives_mission_with_active_live_descendant(conn):
+    umbrella = kb.create_task(
+        conn, title="Synthetic fixture", role="umbrella", mission_kind="test"
+    )
+    gate = kb.create_task(
+        conn, title="Fixture gate", role="gate", parents=[umbrella]
+    )
+    live = kb.create_task(
+        conn, title="Remediation worker", assignee="hotelos-lead", parents=[umbrella]
+    )
+    assert kb.claim_task(conn, umbrella) is not None
+    assert kb.complete_task(conn, umbrella, result="fixture complete")
+    assert kb.claim_task(conn, gate) is not None
+    assert kb.complete_task(conn, gate, result="ACCEPTED", summary="All checks green.")
+    claimed = kb.claim_task(conn, live)
+    assert claimed is not None and claimed.status == "running"
+    assert kb.get_task(conn, umbrella).status == "done"
+
+    assert kb.cleanup_terminal_probe_missions(conn) == []
+    assert kb.get_task(conn, umbrella).status == "done"
+    assert kb.get_task(conn, gate).status == "done"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = 'archived'"
+    ).fetchone()[0] == 0
+
+
+# -- SEC-PROBE-001/002 remediation: fail-closed legacy probe identity --------
+#
+# Security review t_93555643 (#246): the legacy_derived identity
+# ("umbrella.assignee IS NULL") plus a window that only applied to STARTING
+# handoffs let a REAL unassigned umbrella mission whose gate was ACCEPTED and
+# whose terminal handoff is AWAITING_APPROVAL / APPROVAL_REQUIRED be
+# auto-archived immediately, with no bounded window and no owner action.
+# Remediation direction (Product fail-closed): legacy_derived identity alone
+# never authorizes auto-archive. The ONLY authorized legacy paths are
+#  (a) the stale-STARTING signature (newest handoff STARTING + window elapsed),
+#  (b) a structured mission_kind marker, or
+#  (c) an already-journaled ARCHIVE_READY (idempotent resume).
+# A card whose newest terminal_handoff is APPROVAL_REQUIRED / AWAITING_APPROVAL
+# / OWNER_ACTION_REQUIRED is NEVER archived without a structured mission_kind.
+# The bounded window now applies regardless of the handoff actionStatus.
+
+
+def _plant_owner_approval_handoff(conn, umbrella, gate, *, created_at=None):
+    """Plant the fail-closed terminal handoff a REAL mission receives after
+    its final gate: APPROVAL_REQUIRED / AWAITING_APPROVAL, owner action
+    required, no auto-continuation (mirrors the watchdog-corrected payload)."""
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, umbrella, kb.HANDOFF_EVENT_KIND,
+            {
+                "marker": kb.HANDOFF_MARKER,
+                "gate_id": gate,
+                "verdict": "ACCEPTED",
+                "repo_state": {},
+                "next_action": {"type": "DELIVERY_CHECKPOINT", "requiresApproval": True},
+                "decision": {
+                    "actionType": "DELIVERY_CHECKPOINT",
+                    "decisionClass": kb.APPROVAL_REQUIRED,
+                    "requiresApproval": True,
+                    "actionStatus": kb.ACTION_STATUS_AWAITING_APPROVAL,
+                    "ownerAction": "REQUIRED",
+                    "failClosedToApproval": True,
+                },
+                "autoContinue": False,
+                "ownerAction": "REQUIRED",
+                "actionStatus": kb.ACTION_STATUS_AWAITING_APPROVAL,
+            },
+        )
+        if created_at is not None:
+            conn.execute(
+                "UPDATE task_events SET created_at = ? WHERE id = ("
+                "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = ?"
+                ")",
+                (int(created_at), umbrella, kb.HANDOFF_EVENT_KIND),
+            )
+
+
+def _newest_handoff_created_at(conn, task_id) -> int:
+    row = conn.execute(
+        "SELECT created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, kb.HANDOFF_EVENT_KIND),
+    ).fetchone()
+    assert row is not None
+    return int(row["created_at"])
+
+
+def test_cleanup_never_archives_real_unassigned_umbrella_with_owner_approval(conn):
+    """SEC-PROBE-001 regression (scenario H reinforced): a REAL umbrella
+    mission with NO assignee whose gate was ACCEPTED and whose terminal handoff
+    is AWAITING_APPROVAL (owner action required) must NEVER be auto-archived —
+    not immediately, not after the window, without a structured mission_kind.
+    """
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    # This is a REAL mission: no assignee set (Security reproduction), gate
+    # done ACCEPTED, and the dispatcher emitted the fail-closed handoff.
+    _plant_owner_approval_handoff(conn, umbrella, gate)
+    u = kb.get_task(conn, umbrella)
+    g = kb.get_task(conn, gate)
+    assert u is not None and g is not None and u.completed_at and g.completed_at
+    terminal_at = max(int(u.completed_at), int(g.completed_at))
+
+    # Even long after terminality AND after the bounded window, legacy-derived
+    # identity alone must not authorize archiving an owner-approval card.
+    assert kb.cleanup_terminal_probe_missions(
+        conn, now=int(terminal_at) + 10_000
+    ) == []
+    assert kb.get_task(conn, umbrella).status == "done"
+    assert kb.get_task(conn, gate).status == "done"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = 'archived'"
+    ).fetchone()[0] == 0
+
+
+def test_cleanup_never_archives_real_unassigned_umbrella_with_approval_required(conn):
+    """SEC-PROBE-001: the same protection holds when the newest handoff is
+    APPROVAL_REQUIRED/OWNER_ACTION_REQUIRED (not only AWAITING_APPROVAL)."""
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, umbrella, kb.HANDOFF_EVENT_KIND,
+            {
+                "marker": kb.HANDOFF_MARKER,
+                "gate_id": gate,
+                "verdict": "ACCEPTED",
+                "repo_state": {},
+                "next_action": {"type": "DELIVERY_CHECKPOINT", "requiresApproval": True},
+                "decision": {
+                    "actionType": "DELIVERY_CHECKPOINT",
+                    "decisionClass": kb.APPROVAL_REQUIRED,
+                    "requiresApproval": True,
+                    "actionStatus": kb.ACTION_STATUS_AWAITING_APPROVAL,
+                    "ownerAction": "REQUIRED",
+                },
+                "autoContinue": False,
+                "ownerAction": "REQUIRED",
+                "discussion": {"status": kb.DISCUSSION_OWNER_ACTION_REQUIRED},
+            },
+        )
+    u = kb.get_task(conn, umbrella)
+    g = kb.get_task(conn, gate)
+    assert u is not None and g is not None and u.completed_at and g.completed_at
+    terminal_at = max(int(u.completed_at), int(g.completed_at))
+
+    assert kb.cleanup_terminal_probe_missions(
+        conn, now=int(terminal_at) + 10_000
+    ) == []
+    assert kb.get_task(conn, umbrella).status == "done"
+    assert kb.get_task(conn, gate).status == "done"
+
+
+def test_cleanup_legacy_stale_starting_signature_still_archives(conn):
+    """Non-regression (Security re-review point 3): a legacy_derived probe
+    whose newest handoff IS the stale-STARTING signature (STARTING + window
+    elapsed) is still auto-archived after the window."""
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    # Real-looking umbrella but the STARTING handoff was never materialized —
+    # the exact signature of a stuck legacy probe (assignee NULL).
+    _plant_legacy_starting_handoff(conn, umbrella, gate)
+    planted_at = _newest_handoff_created_at(conn, umbrella)
+
+    assert kb.cleanup_terminal_probe_missions(
+        conn, window_seconds=120, now=planted_at + 119
+    ) == []
+    assert kb.get_task(conn, umbrella).status == "done"
+    assert kb.cleanup_terminal_probe_missions(
+        conn, window_seconds=120, now=planted_at + 120
+    ) == [umbrella]
+    assert kb.get_task(conn, umbrella).status == "archived"
+    assert kb.get_task(conn, gate).status == "archived"
+
+
+def test_cleanup_mission_kind_probe_still_archives_after_window(conn):
+    """Non-regression: a STRUCTURED mission_kind='probe' mission (never
+    legacy-derived) is still auto-archived after the bounded window regardless
+    of the handoff actionStatus."""
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    conn.execute(
+        "UPDATE tasks SET mission_kind = 'probe' WHERE id = ?", (umbrella,)
+    )
+    # Structured probes may legitimately carry an owner-approval handoff after
+    # a gate; the marker (not the handoff) is the authorization.
+    _plant_owner_approval_handoff(conn, umbrella, gate)
+    planted_at = _newest_handoff_created_at(conn, umbrella)
+
+    assert kb.cleanup_terminal_probe_missions(
+        conn, window_seconds=120, now=planted_at + 119
+    ) == []
+    assert kb.cleanup_terminal_probe_missions(
+        conn, window_seconds=120, now=planted_at + 120
+    ) == [umbrella]
+    assert kb.get_task(conn, umbrella).status == "archived"
+    assert kb.get_task(conn, gate).status == "archived"
+
+
+def test_cleanup_window_applies_to_any_action_status(conn):
+    """SEC-PROBE-002: the bounded window applies regardless of the newest
+    handoff actionStatus (not only STARTING). A fresh AWAITING_APPROVAL handoff
+    on a structured probe defers the archive until the window elapses."""
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    conn.execute(
+        "UPDATE tasks SET mission_kind = 'probe' WHERE id = ?", (umbrella,)
+    )
+    _plant_owner_approval_handoff(conn, umbrella, gate)
+    planted_at = _newest_handoff_created_at(conn, umbrella)
+
+    # Still inside the bounded window -> no archive, whatever actionStatus.
+    assert kb.cleanup_terminal_probe_missions(
+        conn, window_seconds=120, now=planted_at + 1
+    ) == []
+    assert kb.get_task(conn, umbrella).status == "done"
+    # Window elapsed -> structured probe is archived.
+    assert kb.cleanup_terminal_probe_missions(
+        conn, window_seconds=120, now=planted_at + 120
+    ) == [umbrella]
+    assert kb.get_task(conn, umbrella).status == "archived"
+
+
+def test_cleanup_resumes_legacy_archive_when_archive_ready_already_journaled(conn):
+    """SEC-PROBE-001 clause (c): an already-journaled ARCHIVE_READY is a
+    decision recorded by a previous tick (crash between journal and effective
+    archive). Even a legacy-derived umbrella whose newest handoff is
+    AWAITING_APPROVAL may complete that decided archive — the journal, not
+    the handoff, is the authorization on resume."""
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    # The umbrella is legacy-derived: NO assignee, NO mission_kind — but a
+    # previous tick already journaled ARCHIVE_READY (archive interrupted).
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn, umbrella, kb.TERMINAL_PROBE_CLEANUP_EVENT_KIND,
+            {
+                "classification": kb.DISCUSSION_ARCHIVE_READY,
+                "reason": "probe_terminal",
+                "evidence": {"identity_source": "legacy_derived"},
+            },
+        )
+    _plant_owner_approval_handoff(conn, umbrella, gate)
+
+    assert kb.cleanup_terminal_probe_missions(conn) == [umbrella]
+    u = kb.get_task(conn, umbrella)
+    g = kb.get_task(conn, gate)
+    assert u is not None and u.status == "archived"
+    assert g is not None and g.status == "archived"
