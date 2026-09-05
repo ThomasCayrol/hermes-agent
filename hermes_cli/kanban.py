@@ -393,6 +393,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "as the mission's tracking parent. A completed gate with "
                                "role=gate automatically receives a terminal handoff "
                                "proposal on its umbrella parent (no silent stop).")
+    p_create.add_argument("--mission-kind", default=None,
+                          choices=sorted(kb.VALID_MISSION_KINDS),
+                          help="Structured synthetic-mission marker. 'probe'/'test' "
+                               "declare this card is a harness artifact whose recorded "
+                               "approvals are scenario fixtures. Never sufficient alone: "
+                               "cleanup still requires terminality proof. Marker is "
+                               "forbidden on ordinary missions.")
     p_create.add_argument("--max-runtime", default=None,
                           help="Per-task runtime cap. Accepts seconds (300) or "
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
@@ -1723,6 +1730,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
             role=getattr(args, "role", None),
+            mission_kind=getattr(args, "mission_kind", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

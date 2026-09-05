@@ -2990,6 +2990,23 @@ DEFAULT_CONFIG = {
             "retry_window_minutes": 30,
             "mission_overrides": {},
         },
+        # Bounded watchdog window for a terminal handoff persisted as
+        # STARTING: the handoff is transitional, never resting. If no real
+        # execution witness (same-mission running run / fresh heartbeat)
+        # materialises within this window, the watchdog classifies the
+        # mission: a proven-terminal probe/test is auto-archived, a real
+        # mission is corrected via a recomputed terminal_handoff to
+        # APPROVAL_REQUIRED/AWAITING_APPROVAL. Default 120s ~= two 60s
+        # dispatch ticks; a freshly-spawned worker gets a full window to
+        # claim + heartbeat before any correction.
+        "terminal_watchdog_window_seconds": 120,
+        # Max proven-terminal probe/test missions auto-archived per
+        # dispatcher tick. Bounded so a bulk fixture load cannot spend a
+        # burst of writes in one tick; excess defers to the next tick.
+        # Set 0 to disable probe auto-archive while still letting the
+        # watchdog resolve stale-STARTING probes (they then wait until the
+        # limit is re-enabled or a CLI/operator archive).
+        "terminal_probe_cleanup_limit": 100,
     },
 
     # Bot Mode cross-connection relay (tools/bot_relay.py). Envelopes queued

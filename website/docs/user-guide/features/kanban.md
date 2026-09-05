@@ -646,6 +646,34 @@ missing, ended/crashed, or whose claim/heartbeat expired are corrected with
 a `terminal_handoff_watchdog` event + comment to `APPROVAL_REQUIRED` /
 `AWAITING_APPROVAL` — exactly once per handoff event.
 
+**Terminal probe/test auto-archive (fail-closed).** After the watchdog the
+dispatcher runs `cleanup_terminal_probe_missions`, which auto-archives a
+bounded batch of proven-terminal synthetic missions via `archive_task`
+only — never a destructive delete. A mission is auto-archived only when a
+**structured marker** (`tasks.mission_kind` = `probe`/`test`, set at
+creation) or the **legacy bookkeeping-only signature** proves synthetic
+identity, AND the whole subtree is terminal, AND the bounded window has
+elapsed.
+
+Legacy-derived identity (`umbrella.assignee IS NULL`) alone is **never**
+sufficient, and a card whose newest terminal handoff is `APPROVAL_REQUIRED`
+/ `AWAITING_APPROVAL` / `OWNER_ACTION_REQUIRED` is **never** auto-archived
+without a structured `mission_kind`. The only legacy auto-archive paths are
+the **stale-STARTING signature** (newest handoff `STARTING` with the
+bounded window elapsed), a structured marker, or an already-journaled
+`ARCHIVE_READY` (idempotent resume after an interrupted archive). The
+bounded window applies whatever the newest handoff's `actionStatus`, so a
+fresh handoff of any class suspends the archive decision until the window
+elapses.
+
+> Trade-off (assumed, SEC-PROBE-001/002): legacy probes whose gate was
+> ACCEPTED and whose terminal handoff is `AWAITING_APPROVAL` stay `done`
+> instead of being auto-archived — they are indistinguishable from a real
+> unassigned umbrella mission awaiting owner action. The alternative is a
+> structured backfill (`mission_kind='probe'` on the known legacy fixture
+> set); that is a CDP/owner decision, not something the core derives.
+
+
 **Reconciliation.** Re-running the handoff (`hermes kanban handoff <gate-id>
 --recompute`) re-derives the snapshot from current persisted state and
 appends a corrective RECOMPUTED handoff whenever the structured verdict, the
@@ -747,6 +775,8 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
+| `terminal_watchdog_window_seconds` | `120` | Bounded window for a terminal handoff persisted as `STARTING`. If no live execution witness (same-mission running run / fresh heartbeat) materialises within the window, the dispatcher watchdog classifies the mission: a proven-terminal probe/test mission is auto-archived; a real mission is corrected via a recomputed `terminal_handoff` to `APPROVAL_REQUIRED` / `AWAITING_APPROVAL` (never indefinite `STARTING`). A freshly-spawned worker gets a full window to claim + heartbeat before any correction. |
+| `terminal_probe_cleanup_limit` | `100` | Max proven-terminal probe/test missions auto-archived per dispatcher tick (bounded; excess defers to the next tick). `0` disables probe auto-archive entirely. Auto-archive calls `archive_task` only — never a destructive delete — and preserves all runs/events/comments. |
 
 And the two auxiliary LLM slots:
 
