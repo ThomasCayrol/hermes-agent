@@ -34,6 +34,7 @@ import {
   addComment,
   deleteTask,
   estimateTask,
+  fetchDiagnostics,
   fetchLog,
   fetchProfiles,
   fetchTask,
@@ -47,6 +48,7 @@ import {
 } from './api'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
+  ATTENTION_ORDER,
   type Diagnostic,
   type DiagnosticAction,
   type KanbanAttachment,
@@ -178,26 +180,125 @@ function MetaRow({ children, label }: { children: ReactNode; label: string }) {
   )
 }
 
-/** The dashboard's diagnostics panel: severity-toned, plain-English, with the
- *  backend's structured recovery actions as buttons. `reassign` is skipped —
- *  the Assignee control in the meta table IS that action, inline. */
-function Diagnostics({ items, onReclaim }: { items: Diagnostic[]; onReclaim: () => void }) {
-  const k = useKanban()
+/** Visual tone is driven by the ENGINE's operator-attention axis (not the
+ *  technical severity alone) — see kanban_diagnostics.attention_banner_policy
+ *  and the UX tone map (Operator Diagnostics Clarity contract §2). */
+const ATTENTION_TONE: Record<string, string> = {
+  NONE: 'var(--ui-text-quaternary)',
+  INFO: 'var(--ui-text-secondary)',
+  WARNING: '#fbbf24',
+  ACTION_REQUIRED: 'var(--destructive, #f87171)',
+  CRITICAL: '#ef4444'
+}
 
-  const act = (action: DiagnosticAction) => {
-    if (action.kind === 'reclaim') {
-      onReclaim()
-    } else if (action.kind === 'cli_hint') {
-      void navigator.clipboard.writeText(String(action.payload?.command ?? action.label))
-      host.notify({ kind: 'info', message: k.commandCopied })
-    }
+/** Text label always accompanies the tone (colour is never the only signal). */
+const ATTENTION_LABEL: Record<string, string> = {
+  NONE: '—',
+  INFO: 'Info',
+  WARNING: 'Avertissement',
+  ACTION_REQUIRED: 'Action requise',
+  CRITICAL: 'Critique'
+}
+
+function OperatorField({ label, value }: { label: string; value?: null | string }) {
+  if (!value) {
+    return null
   }
 
   return (
+    <div className="min-w-0">
+      <span className="block text-[0.625rem] font-medium tracking-wide text-(--ui-text-quaternary)">
+        {label}
+      </span>
+      <span className="block whitespace-pre-wrap text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">
+        {value}
+      </span>
+    </div>
+  )
+}
+
+/** The diagnostics panel: attention-toned callouts answering STATUS / CAUSE /
+ *  IMPACT / OWNER ACTION / SYSTEM ACTION in the engine's French operator copy,
+ *  with collapsible English technical details below. Buttons follow the action
+ *  contract: primary buttons execute the real resulting action (read-only run,
+ *  reclaim, unblock, comment composer, assignee picker); raw CLI stays a
+ *  secondary copy affordance. */
+function Diagnostics({
+  items,
+  onReclaim,
+  onUnblock,
+  onComment,
+  onReassign,
+  running
+}: {
+  items: Diagnostic[]
+  onReclaim: () => void
+  onUnblock: () => void
+  onComment: () => void
+  onReassign: () => void
+  running?: boolean
+}) {
+  const k = useKanban()
+  const [diagBusy, setDiagBusy] = useState(false)
+
+  const runDiagnostics = () => {
+    setDiagBusy(true)
+    fetchDiagnostics()
+      .then(result => {
+        const n = result?.count ?? 0
+        host.notify({
+          kind: n > 0 ? 'warning' : 'info',
+          message: n > 0 ? k.diagRunFound(n) : k.diagRunNone
+        })
+      })
+      .catch(() => host.notify({ kind: 'error', message: k.diagRunFailed }))
+      .finally(() => setDiagBusy(false))
+  }
+
+  const act = (action: DiagnosticAction) => {
+    switch (action.kind) {
+      case 'reclaim':
+        onReclaim()
+        break
+      case 'unblock':
+        onUnblock()
+        break
+      case 'comment':
+        onComment()
+        break
+      case 'reassign':
+        onReassign()
+        break
+      case 'run_diagnostics':
+        runDiagnostics()
+        break
+      case 'cli_hint':
+        void navigator.clipboard.writeText(String(action.payload?.command ?? action.label))
+        host.notify({ kind: 'info', message: k.commandCopied })
+        break
+      default:
+        // view_worker / view_queue are read-only navigations owned by the
+        // board-level surfaces (attention strip / diagnostics view); this
+        // drawer has no in-panel target for them, so they are not rendered
+        // as buttons here (the payload keeps them for those surfaces).
+        break
+    }
+  }
+
+  const RENDERABLE = new Set(['reclaim', 'unblock', 'comment', 'reassign', 'run_diagnostics', 'cli_hint'])
+  const ordered = [...items].sort((a, b) => ATTENTION_ORDER.indexOf(b.attention ?? '') - ATTENTION_ORDER.indexOf(a.attention ?? ''))
+
+  return (
     <div className="flex flex-col gap-2">
-      {items.map(diag => {
-        const tone = SEVERITY_TONE[diag.severity]
-        const actions = diag.actions.filter(action => action.kind === 'reclaim' || action.kind === 'cli_hint')
+      {ordered.map(diag => {
+        const attention = diag.attention ?? 'INFO'
+        const tone = ATTENTION_TONE[attention] ?? SEVERITY_TONE[diag.severity] ?? 'var(--ui-text-secondary)'
+        const actions = diag.actions.filter(action => RENDERABLE.has(action.kind))
+        const operatorBody = [
+          { label: 'STATUS', value: diag.operator_status || diag.title },
+          { label: 'CAUSE', value: diag.operator_cause },
+          { label: diag.operator_risk ? 'RISK' : 'IMPACT', value: diag.operator_risk || diag.operator_impact }
+        ].filter(row => row.value)
 
         return (
           <Callout
@@ -205,13 +306,53 @@ function Diagnostics({ items, onReclaim }: { items: Diagnostic[]; onReclaim: () 
             title={`${diag.title}${diag.count > 1 ? ` ×${diag.count}` : ''}`}
             tone={tone}
           >
-            <p className="whitespace-pre-wrap text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">
-              {diag.detail}
-            </p>
+            <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+              <Badge
+                size="xs"
+                variant={attention === 'WARNING' ? 'warn' : attention === 'CRITICAL' || attention === 'ACTION_REQUIRED' ? 'destructive' : 'muted'}
+              >
+                {ATTENTION_LABEL[attention] ?? attention}
+              </Badge>
+              {diag.classification && (
+                <span className="font-mono text-[0.625rem] text-(--ui-text-quaternary)">
+                  {diag.classification}
+                </span>
+              )}
+              {diag.auto_recovery_state && diag.auto_recovery_state !== 'none' && (
+                <span className="font-mono text-[0.625rem] text-(--ui-text-quaternary)">
+                  auto-recovery: {diag.auto_recovery_state}
+                </span>
+              )}
+            </div>
+            <div className="mb-2 flex flex-col gap-1.5">
+              {operatorBody.map(row => (
+                <OperatorField key={row.label} label={row.label} value={row.value} />
+              ))}
+              <OperatorField label="OWNER ACTION" value={diag.owner_action ?? 'NONE'} />
+              {diag.system_action && (
+                <OperatorField label="SYSTEM ACTION" value={diag.system_action} />
+              )}
+            </div>
+            <details className="group mb-2">
+              <summary className="cursor-pointer text-[0.6875rem] text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)">
+                technical details
+              </summary>
+              <div className="mt-1 flex flex-col gap-1">
+                <p className="whitespace-pre-wrap text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)">
+                  {diag.detail}
+                </p>
+                {diag.data && Object.keys(diag.data).length > 0 && (
+                  <p className="font-mono text-[0.625rem] leading-relaxed text-(--ui-text-quaternary)">
+                    {JSON.stringify(diag.data)}
+                  </p>
+                )}
+              </div>
+            </details>
             {actions.length > 0 && (
               <div className="flex flex-wrap gap-1.5">
                 {actions.map(action => (
                   <Button
+                    disabled={diagBusy && action.kind === 'run_diagnostics'}
                     key={`${action.kind}-${action.label}`}
                     onClick={() => act(action)}
                     size="xs"
@@ -248,6 +389,7 @@ function AssigneeMenu({
       <DropdownMenuTrigger asChild>
         <button
           className="-mx-1 inline-flex max-w-full items-center gap-1.5 rounded px-1 py-0.5 text-left transition-colors hover:bg-(--chrome-action-hover)"
+          data-assignee-menu-trigger=""
           type="button"
         >
           {current ? (
@@ -316,7 +458,7 @@ function CommentComposer({
   }
 
   return (
-    <div className="flex flex-col gap-1.5">
+    <div className="flex flex-col gap-1.5" data-kanban-composer="">
       <div className="relative">
         <Textarea
           className={cn('field-sizing-content max-h-40 min-h-0 resize-none', running ? 'pr-[3.5rem]' : 'pr-[5rem]')}
@@ -621,6 +763,19 @@ export function TaskDrawer({
       (err: unknown) => host.notify({ kind: 'error', message: errText(err) })
     )
 
+  // Diagnostics action helpers — real affordances inside this drawer: the
+  // comment composer below and the inline assignee menu in the meta table.
+  const focusComposer = () => {
+    const el = document.querySelector<HTMLTextAreaElement>('[data-kanban-composer] textarea')
+
+    el?.scrollIntoView({ block: 'center' })
+    el?.focus()
+  }
+
+  const openAssigneeMenu = () => {
+    document.querySelector<HTMLButtonElement>('[data-assignee-menu-trigger]')?.click()
+  }
+
   const commentMut = useMutation({
     mutationFn: (body: string) => addComment(id!, body),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
@@ -794,7 +949,14 @@ export function TaskDrawer({
 
             {task.diagnostics && task.diagnostics.length > 0 && (
               <Section label={k.diagnosticsN(task.diagnostics.length)}>
-                <Diagnostics items={task.diagnostics} onReclaim={() => void mutate(() => reclaimTask(task.id))()} />
+                <Diagnostics
+                  items={task.diagnostics}
+                  onComment={focusComposer}
+                  onReassign={openAssigneeMenu}
+                  onReclaim={() => void mutate(() => reclaimTask(task.id))()}
+                  onUnblock={() => void mutate(() => patchTask(task.id, { status: 'ready' }))()}
+                  running={running}
+                />
               </Section>
             )}
 

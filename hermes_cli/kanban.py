@@ -1925,9 +1925,22 @@ def _cmd_show(args: argparse.Namespace) -> int:
     diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
+        attention_marker = {
+            "NONE": "·", "INFO": "i", "WARNING": "▲",
+            "ACTION_REQUIRED": "●", "CRITICAL": "●",
+        }
         print(f"\n  Diagnostics ({len(diags)}):")
         for d in diags:
             print(f"    {sev_marker.get(d.severity, '?')} [{d.severity}] {d.title}")
+            attn = d.attention or kd.ATTENTION_INFO
+            print(
+                f"       attention: {attention_marker.get(attn, '?')} {attn} "
+                f"| owner action: {d.owner_action or kd.OWNER_ACTION_NONE}"
+                + (f" | classification: {d.classification}" if d.classification else "")
+                + (" | banner: oui" if d.attention_banner else "")
+            )
+            if d.operator_status:
+                print(f"       {d.operator_status}")
             if d.data:
                 bits = []
                 for k, v in d.data.items():
@@ -2079,6 +2092,11 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     diag_config = kd.config_from_runtime_config(load_config())
 
     with kb.connect_closing() as conn:
+        # Read-only board/dispatcher evidence for the classifier (stranded
+        # outcomes, concurrency). Every input is optional; missing evidence
+        # is never treated as health.
+        board_context = kd.build_board_context(conn, config=diag_config)
+
         # Either one-task mode or fleet mode.
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
@@ -2092,6 +2110,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     kb.list_runs(conn, args.task),
                     graph=kb.task_graph_context(conn, args.task),
                     config=diag_config,
+                    board_context=board_context,
                 )
             }
         else:
@@ -2126,6 +2145,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                         run_by.get(tid, []),
                         graph=graph_by.get(tid),
                         config=diag_config,
+                        board_context=board_context,
                     )
                     if dl:
                         diags_by_task[tid] = dl
@@ -2185,6 +2205,14 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
         print(f"  {tid}  {status:8s}  @{assignee:18s}  {title}")
         for d in dl:
             print(f"    {sev_marker.get(d.severity, '?')} [{d.severity}] {d.kind}: {d.title}")
+            attn = d.attention or kd.ATTENTION_INFO
+            print(
+                f"       attention: {attn:15s} owner action: {d.owner_action or kd.OWNER_ACTION_NONE:8s}"
+                + (f" classification: {d.classification}" if d.classification else "")
+                + (" [banner]" if d.attention_banner else "")
+            )
+            if d.operator_status:
+                print(f"       {d.operator_status}")
             if d.data:
                 # Compact key:value pairs on one line.
                 bits = []

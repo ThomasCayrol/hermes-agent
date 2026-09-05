@@ -96,6 +96,10 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _PREVIEW_MAX_CHARS,
     _PREVIEW_SCAFFOLD_WINDOW,
     _PREVIEW_SCAFFOLDED_SQL,
+    _acquire_db_flock,
+    _clear_lock_holder_record,
+    _describe_lock_holder,
+    _read_lock_holder_record,
 )
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
@@ -369,6 +373,20 @@ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 # probing again. Long enough that a genuinely unreadable file isn't retried per
 # query; short enough that transient fd pressure doesn't strand the read pool.
 _READ_OPEN_RETRY_SECONDS = 60.0
+
+# Transient SQLITE_IOERR retry budget for READ-ONLY opens (#100436). A WAL
+# database being actively written (checkpoint, WAL reset/truncate, frame
+# flush) can surface "disk I/O error" to a concurrent ``mode=ro`` reader in
+# a millisecond-wide transition window: the read-only connection cannot
+# perform the WAL recovery a read through a stale or mid-update -shm file
+# needs, because recovery requires writing the -shm index, which mode=ro
+# refuses. The window closes on its own (the writer finishes the transition),
+# so a bounded number of short retries makes the open succeed instead of
+# 500-ing the whole /api/sessions poll (or any other read-only opener).
+# Deliberately NOT attempted on writable opens: a writer owns the
+# transition, so an IOERR there means a real storage/fd problem.
+_READ_ONLY_IOERR_RETRY_ATTEMPTS = 3
+_READ_ONLY_IOERR_RETRY_BACKOFF_S = 0.05
 
 # Hard ceiling on read-only connections ALIVE at once against one database
 # FILE — pooled idle ones and checked-out ones together, summed over every
@@ -2078,6 +2096,52 @@ def is_malformed_db_error(exc: BaseException) -> bool:
     return any(marker in str(exc).lower() for marker in _MALFORMED_DB_MARKERS)
 
 
+# SQLITE_IOERR, matched as a plain substring so wrapped error strings still
+# classify. Shared by the read-only open retry and the write-path BEGIN retry.
+_DISK_IO_ERROR_MARKER = "disk i/o error"
+
+# Broader set for HTTP classification: a read that failed for one of these
+# reasons found the store BUSY, not gone. Callers map it to 503 (retry, the
+# list was not cleared) instead of 500. Corruption is deliberately absent —
+# a malformed store must surface, not be retried into a timeout.
+_TRANSIENT_SQLITE_MARKERS = (
+    _DISK_IO_ERROR_MARKER,
+    "database is locked",
+    "database table is locked",
+    "busy",
+)
+
+
+def is_transient_sqlite_error(exc: BaseException) -> bool:
+    """True when a SQLite failure means "busy right now", not "damaged".
+
+    One predicate so the read paths cannot drift apart on what counts as
+    recoverable: the read-only open retry, and the HTTP 503-vs-500 split on
+    the session-list endpoints, classify the same way.
+    """
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    message = str(exc).lower()
+    return any(marker in message for marker in _TRANSIENT_SQLITE_MARKERS)
+
+
+def _is_transient_read_only_ioerr(exc: sqlite3.OperationalError, *, attempt: int) -> bool:
+    """True when a read-only open should be retried rather than raised.
+
+    A ``mode=ro`` connection cannot perform WAL recovery (recovery needs to
+    write the -shm index, which read-only mode refuses), so a concurrent WAL
+    checkpoint / reset / frame-flush can surface ``SQLITE_IOERR`` ("disk I/O
+    error") to a reader on an otherwise healthy database (#100436). The
+    transition is millisecond-scale, so a bounded number of short retries
+    clears it without changing classification for genuine storage failures —
+    a persistent IOERR still exhausts the budget and propagates.
+    """
+    return (
+        attempt < _READ_ONLY_IOERR_RETRY_ATTEMPTS
+        and _DISK_IO_ERROR_MARKER in str(exc).lower()
+    )
+
+
 def is_malformed_schema_error(exc: BaseException) -> bool:
     """True only when SQLite explicitly reports malformed schema text.
 
@@ -2272,14 +2336,19 @@ def _cross_process_repair_lock(db_path: Path):
     """Serialize state.db schema surgery across processes.
 
     Yields True when this process holds the repair lock for *db_path*, False
-    when the bounded acquire timed out.  Unlike the kanban init lock — whose
-    critical section is idempotent, so proceeding without the lock is merely
-    redundant work — proceeding here would be exactly the unsafe interleaving
-    we are trying to prevent, so a caller that gets False must NOT do surgery.
+    when the bounded acquire timed out or the lock file could not be opened at
+    all.  Unlike the kanban init lock — whose critical section is idempotent,
+    so proceeding without the lock is merely redundant work — proceeding here
+    would be exactly the unsafe interleaving we are trying to prevent, so a
+    caller that gets False must NOT do surgery.
 
     ``flock`` is the right primitive for this: the kernel drops the lock when
     the holding process dies, so a crashed repairer cannot leave a stale lock
-    that wedges every future repair (a pidfile would).  The acquire is still
+    that wedges every future repair (a pidfile would).  One exception exists
+    (issue #100108): a forked child that inherited the lock fd keeps the
+    flock alive after the acquirer dies, so the acquire path records the
+    holder's pid + start time and breaks the lock when that holder is
+    provably dead (see ``_acquire_db_flock``).  The acquire is still
     bounded because a *live* repairer can legitimately sit in ``VACUUM`` for
     minutes on a large DB, and an unbounded wait would hang the caller's open
     with no traceback (the failure shape of #36644).
@@ -2289,42 +2358,56 @@ def _cross_process_repair_lock(db_path: Path):
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = lock_path.open("a+b")
     except OSError as exc:
-        # Read-only dir, exhausted fds, exotic filesystem: fall back to the
-        # in-process behaviour that shipped before this lock existed rather
-        # than refusing to repair a DB we could otherwise heal.
+        # Fail closed, exactly as a timed-out acquire does.  A lock file we
+        # cannot even open means the filesystem is out of space, inodes or
+        # descriptors — and a sibling that opened ITS handle before the disk
+        # filled is still inside writable_schema surgery or VACUUM.  Yielding
+        # True here let two processes run schema surgery on the same live
+        # state.db concurrently, which is itself the corruption source this
+        # lock exists to remove (#100368: the disk-full trigger, then a fresh
+        # corruption on every boot with other writers alive).  Callers already
+        # handle False by re-probing and reporting, and on a read-only
+        # directory no repair strategy could have written anyway.
         logger.warning(
-            "Could not open state.db repair lock %s (%s) — proceeding with "
-            "in-process serialisation only.", lock_path, exc,
+            "Could not open state.db repair lock %s (%s) — skipping schema "
+            "surgery rather than running it without cross-process authority.",
+            lock_path, exc,
         )
-        yield True
+        yield False
         return
 
     acquired = False
     try:
-        deadline = time.monotonic() + _REPAIR_LOCK_TIMEOUT_SECONDS
-        while True:
-            try:
-                if _IS_WINDOWS:
+        if _IS_WINDOWS:
+            deadline = time.monotonic() + _REPAIR_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
                     import msvcrt
 
                     handle.seek(0)
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-                break
-            except (BlockingIOError, OSError):
-                if time.monotonic() >= deadline:
+                    acquired = True
                     break
-                time.sleep(_REPAIR_LOCK_POLL_SECONDS)
+                except (BlockingIOError, OSError):
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(_REPAIR_LOCK_POLL_SECONDS)
+        else:
+            acquired, handle = _acquire_db_flock(
+                str(lock_path),
+                handle,
+                _REPAIR_LOCK_TIMEOUT_SECONDS,
+                _REPAIR_LOCK_POLL_SECONDS,
+                "state.db repair lock",
+            )
         if not acquired:
+            record = None if _IS_WINDOWS else _read_lock_holder_record(handle)
             logger.warning(
                 "state.db repair lock %s held by another process for more "
                 "than %.0fs — skipping schema surgery in this process to "
-                "avoid racing the repairer.",
+                "avoid racing the repairer. Recorded holder: %s.",
                 lock_path, _REPAIR_LOCK_TIMEOUT_SECONDS,
+                _describe_lock_holder(record),
             )
         yield acquired
     finally:
@@ -2338,11 +2421,71 @@ def _cross_process_repair_lock(db_path: Path):
                 else:
                     import fcntl
 
+                    _clear_lock_holder_record(handle)
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         except OSError:  # pragma: no cover - best effort release
             pass
         finally:
             handle.close()
+
+
+def _try_acquire_auto_maintenance_lock(db_path: Path) -> Optional[Any]:
+    """Non-blocking cross-process lock for one auto-maintenance pass.
+
+    The kernel releases this advisory lock if the holder exits, unlike a
+    durable pid/meta marker. A caller that cannot acquire it must skip the
+    pass: otherwise two startups can both pass the interval check and the
+    second can prune a row the first has only just closed recoverably.
+    """
+    lock_path = db_path.with_name(db_path.name + ".auto-maintenance.lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+    except OSError as exc:
+        logger.warning(
+            "Could not open state.db auto-maintenance lock %s (%s) — skipping "
+            "automatic maintenance.",
+            lock_path,
+            exc,
+        )
+        return None
+
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(  # type: ignore[attr-defined]
+                handle.fileno(), msvcrt.LK_NBLCK, 1  # type: ignore[attr-defined]
+            )
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        handle.close()
+        return None
+    return handle
+
+
+def _release_auto_maintenance_lock(handle: Any) -> None:
+    """Release a handle returned by :func:`_try_acquire_auto_maintenance_lock`."""
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(  # type: ignore[attr-defined]
+                handle.fileno(), msvcrt.LK_UNLCK, 1  # type: ignore[attr-defined]
+            )
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:  # pragma: no cover - best effort release
+        pass
+    finally:
+        handle.close()
 
 
 def _bump_schema_cookie(conn: sqlite3.Connection) -> None:
@@ -3539,16 +3682,19 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     result = report
     with _cross_process_repair_lock(db_path) as holding_lock:
         if not holding_lock:
-            # Another process is still inside its critical section. It may
-            # nonetheless have healed the file already (long VACUUM after a
-            # successful strategy), so re-probe before reporting failure.
+            # Another process is still inside its critical section, or the
+            # lock file itself could not be opened (full disk / no fds). It
+            # may nonetheless have healed the file already (long VACUUM after
+            # a successful strategy), so re-probe before reporting failure.
             if _db_opens_cleanly(db_path) is None:
                 report["repaired"] = True
                 report["strategy"] = "repaired_by_other_process"
             else:
                 report["error"] = (
-                    "another process holds the state.db repair lock; skipped "
-                    "schema surgery to avoid racing it"
+                    "could not obtain the state.db repair lock (held by "
+                    "another process, or the lock file was unopenable); "
+                    "skipped schema surgery to avoid racing a concurrent "
+                    "repairer"
                 )
         else:
             # The fast check above avoids taking the lock for a known-exhausted
@@ -4224,12 +4370,79 @@ def divert_session_transcript_jsonl(session_id: str, messages) -> "Optional[Path
     return path
 
 
-def _read_sqlite_application_id(db_path: Path) -> "Optional[int]":
-    """Read application_id from the SQLite header without opening a connection."""
+# _read_sqlite_application_id runs on EVERY write via _raise_if_db_replaced,
+# against the LIVE state.db.  A bare open()/read()/close() there is the
+# howtocorrupt §2.2 bug: close() cancels every POSIX advisory lock this
+# process holds on the file — measured on Linux/SQLite 3.53.1, one probe call
+# drops the WAL-mode DMS shared lock the writer connection holds on state.db
+# (see hermes_cli/sqlite_safe_read.py for the module built around this rule).
+# With the DMS lock gone, a fresh opener in another process can treat this
+# writer as dead and rerun WAL-index recovery underneath it.
+#
+# The probe therefore reads through a per-path fd cached for the life of the
+# process: opening an fd never cancels locks (only close() does), and
+# os.pread takes no shared file position.  When the path is re-pointed at a
+# new inode (the very replacement this probe exists to detect), the stale fd
+# is RETIRED, never closed — closing it would cancel the live connection's
+# locks on the old file, the exact bug being avoided.  Replacement events are
+# rare and halt writes anyway, so the leak is bounded.
+_HEADER_PROBE_LOCK = threading.Lock()
+_HEADER_PROBE_FDS: "dict[str, tuple[int, int, int]]" = {}  # key -> (fd, dev, ino)
+_RETIRED_HEADER_PROBE_FDS: "list[int]" = []  # intentionally never closed
+
+
+def _pread_db_header(db_path: Path, length: int) -> "Optional[bytes]":
+    """Lock-safe raw header read of a possibly-live SQLite database.
+
+    POSIX: pread from a cached, never-closed fd (rebound when the path names
+    a new inode).  Windows: plain read — advisory-lock cancellation is a
+    POSIX-only hazard and msvcrt locks do not share the failure mode.
+    """
+    if _IS_WINDOWS:
+        try:
+            with db_path.open("rb") as handle:
+                return handle.read(length)
+        except OSError:
+            return None
+    key = str(db_path)
     try:
-        with db_path.open("rb") as handle:
-            header = handle.read(_STATE_DB_APPLICATION_ID_OFFSET + 4)
+        st = os.stat(db_path)
     except OSError:
+        return None
+    with _HEADER_PROBE_LOCK:
+        cached = _HEADER_PROBE_FDS.get(key)
+        if cached is not None and (cached[1], cached[2]) != (st.st_dev, st.st_ino):
+            # Path re-pointed at a new file. Retire (never close) the old fd.
+            _RETIRED_HEADER_PROBE_FDS.append(cached[0])
+            cached = None
+            del _HEADER_PROBE_FDS[key]
+        if cached is None:
+            try:
+                fd = os.open(db_path, os.O_RDONLY)
+            except OSError:
+                return None
+            try:
+                fst = os.fstat(fd)
+            except OSError:
+                _RETIRED_HEADER_PROBE_FDS.append(fd)
+                return None
+            cached = (fd, fst.st_dev, fst.st_ino)
+            _HEADER_PROBE_FDS[key] = cached
+        try:
+            return os.pread(cached[0], length, 0)
+        except OSError:
+            return None
+
+
+def _read_sqlite_application_id(db_path: Path) -> "Optional[int]":
+    """Read application_id from the SQLite header without opening a connection.
+
+    Safe against live databases: routed through :func:`_pread_db_header`,
+    which never issues a ``close()`` that would cancel this process's POSIX
+    locks on the file (howtocorrupt §2.2).
+    """
+    header = _pread_db_header(db_path, _STATE_DB_APPLICATION_ID_OFFSET + 4)
+    if header is None:
         return None
     if len(header) < _STATE_DB_APPLICATION_ID_OFFSET + 4:
         return None
@@ -4255,6 +4468,30 @@ def _stat_db_file_identity(path: Path) -> "Optional[tuple]":
     if not st.st_dev or not st.st_ino:
         return None
     return (st.st_dev, st.st_ino)
+
+
+# ── Process-wide shared SessionDB registry (#90837) ──
+#
+# The registry itself lives in hermes_state_registry.py — a bounded
+# module owning acquisition, generation identity, refcounting,
+# retirement, and teardown.  These re-exports keep the historical
+# import path (``from hermes_state import get_shared_session_db``)
+# working for every call site and test that imports from here.
+#
+# Routing rules (see hermes_state_registry for the full lifecycle):
+#   - Long-lived in-process callers (gateway, tui_gateway, cron,
+#     in-process tools) share ONE writer connection per resolved path
+#     via get_shared_session_db().
+#   - CLI one-shots, recovery flows, and read-only cross-profile opens
+#     keep using SessionDB() directly with their own close().
+
+from hermes_state_registry import (  # noqa: F401  (re-export)
+    close_shared_session_dbs,
+    get_shared_session_db,
+    release_or_close,
+    release_shared_session_db,
+)
+
 
 
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
@@ -4778,6 +5015,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     single writer via WAL mode). Each method opens its own cursor.
     """
 
+    # Only these state-owned producers participate in automatic stale-open
+    # reconciliation. Messaging-platform and UI/desktop sources have separate
+    # lifecycle owners; unknown/future sources fail closed (#60609).
+    _AUTO_PRUNE_STALE_OPEN_SOURCES: Tuple[str, ...] = (
+        "cli",
+        "cron",
+        "kanban",
+        "acp",
+        "api_server",
+        "subagent",
+        "tool",
+    )
+
     # ── Write-contention tuning ──
     # With multiple hermes processes (gateway + CLI sessions + worktree agents)
     # all sharing one state.db, WAL write-lock contention causes visible TUI
@@ -5002,6 +5252,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._token_writer_stop = False
         self._token_writer_busy = False
         self._token_atexit_hook: Optional[Callable[[], None]] = None
+        # Set True when this instance is opened via get_shared_session_db().
+        # Makes close() a no-op so the registry (not individual callers)
+        # controls the connection lifecycle (#90837).
+        self._shared_registry_owned = False
         initialization_complete = False
         try:
             if read_only:
@@ -5013,46 +5267,67 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # must already exist + be initialised (callers guard on
                 # db_path.exists()); a SELECT against an empty file raises and
                 # the caller degrades per-profile.
-                self._conn = _connect_tracked_db(
-                    f"file:{self.db_path}?mode=ro",
-                    tracking_path=self.db_path,
-                    uri=True,
-                    check_same_thread=False,
-                    timeout=1.0,
-                    isolation_level=None,
-                )
-                self._conn.row_factory = sqlite3.Row
-                # FTS capability flags normally come from writable schema
-                # initialisation. Probe existing virtual tables with SELECTs
-                # only so read-only search keeps its FTS and trigram paths.
-                # Close the connection on ANY probe failure (e.g. malformed
-                # schema raises DatabaseError, not the OperationalError the
-                # probe handles). The constructor's outer finally also covers
-                # failures before this probe and BaseException paths, so a
-                # leaked tracked connection cannot block _backup_db_file's
-                # raw-copy for the rest of the process — the writable heal
-                # that follows would then repair WITHOUT its forensic backup.
-                try:
-                    apply_database_pragmas(self._conn, db_label="state.db")
-                    cursor = self._conn.cursor()
-                    self._fts_enabled = (
-                        self._fts_table_probe(cursor, "messages_fts") is True
-                    )
-                    if self._fts_enabled:
-                        self._trigram_available = (
-                            self._fts_table_probe(
-                                cursor,
-                                "messages_fts_trigram",
-                            )
-                            is True
-                        )
-                except BaseException:
-                    conn, self._conn = self._conn, None
+                open_attempt = 0
+                while True:
                     try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    raise
+                        self._conn = _connect_tracked_db(
+                            f"file:{self.db_path}?mode=ro",
+                            tracking_path=self.db_path,
+                            uri=True,
+                            check_same_thread=False,
+                            timeout=1.0,
+                            isolation_level=None,
+                        )
+                        self._conn.row_factory = sqlite3.Row
+                        # FTS capability flags normally come from writable schema
+                        # initialisation. Probe existing virtual tables with
+                        # SELECTs only so read-only search keeps its FTS and
+                        # trigram paths. Close the connection on ANY probe
+                        # failure (e.g. malformed schema raises DatabaseError,
+                        # not the OperationalError the probe handles). The
+                        # constructor's outer finally also covers failures
+                        # before this probe and BaseException paths, so a
+                        # leaked tracked connection cannot block
+                        # _backup_db_file's raw-copy for the rest of the
+                        # process — the writable heal that follows would then
+                        # repair WITHOUT its forensic backup.
+                        try:
+                            apply_database_pragmas(self._conn, db_label="state.db")
+                            cursor = self._conn.cursor()
+                            self._fts_enabled = (
+                                self._fts_table_probe(cursor, "messages_fts")
+                                is True
+                            )
+                            if self._fts_enabled:
+                                self._trigram_available = (
+                                    self._fts_table_probe(
+                                        cursor,
+                                        "messages_fts_trigram",
+                                    )
+                                    is True
+                                )
+                        except BaseException:
+                            conn, self._conn = self._conn, None
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                            raise
+                        break
+                    except sqlite3.OperationalError as ioerr:
+                        # A WAL checkpoint / reset / frame-flush in flight on
+                        # the writer side can surface SQLITE_IOERR to a
+                        # concurrent mode=ro reader (it cannot perform the
+                        # recovery the read needs — recovery writes the -shm
+                        # index, which mode=ro refuses). The transition closes
+                        # in milliseconds, so retry a bounded number of times
+                        # before classifying the store as failed (#100436).
+                        if not _is_transient_read_only_ioerr(
+                            ioerr, attempt=open_attempt
+                        ):
+                            raise
+                        open_attempt += 1
+                        time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
                 self._record_db_file_identity()
                 initialization_complete = True
                 return
@@ -5820,6 +6095,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Set on the first compression-busy collision so the short wait is
         # measured from then, not from the start of the write.
         compression_deadline: Optional[float] = None
+        # One retry for SQLITE_IOERR raised by BEGIN IMMEDIATE itself. The
+        # callback has not run at that point, so there is no durable effect
+        # to replay and the retry is exactly-once safe (#99502's contract).
+        # Once the callback starts, an IOERR leaves the write's settlement
+        # unknown and must propagate — this helper owns non-idempotent
+        # transcript/counter mutations, not just idempotent UPSERTs.
+        ioerr_begin_retried = False
 
         # Transient engine-level error observed on contended WAL appends
         # (dual gateway/agent writers; FTS5 trigram sync holds the write
@@ -5833,6 +6115,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         while True:
             self._raise_if_db_replaced()
+            fn_started = False
             try:
                 with self._lock:
                     if self._conn is None:
@@ -5841,6 +6124,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         self._reopen_after_close_locked(context="write")
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
+                        fn_started = True
                         result = fn(self._conn)
                         self._conn.commit()
                     except BaseException:
@@ -5893,7 +6177,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     ) from exc
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
-                # Non-lock error or patience exhausted — propagate.
+                if (
+                    _DISK_IO_ERROR_MARKER in err_msg
+                    and not fn_started
+                    and not ioerr_begin_retried
+                    and self._sleep_before_write_retry(deadline, patience_s)
+                ):
+                    # BEGIN IMMEDIATE itself hit a transient WAL-transition
+                    # IOERR. Nothing has been mutated, so retrying on the SAME
+                    # connection replays nothing. Never close()+reopen to
+                    # "heal" it: close() cancels this process's POSIX locks on
+                    # the file for every sibling connection (howtocorrupt §2.2).
+                    ioerr_begin_retried = True
+                    continue
+                # Non-lock error, the callback already ran (settlement is
+                # unknown — do not replay), or patience exhausted.
                 raise
             except sqlite3.DatabaseError as exc:
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
@@ -6360,7 +6658,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         many times an hour, and a TRUNCATE fires a full WAL reset that
         races the gateway's live writer and tears B-tree pages — issue
         #45383). Read-only connections never request a checkpoint.
+
+        When this instance is shared (opened via ``get_shared_session_db``),
+        ``close()`` RELEASES one refcount instead of tearing down the
+        connection: the registry owns the lifecycle and only closes on the
+        final release (#90837).  This prevents one caller's close from
+        tearing down the writer connection that other callers in the same
+        process are still using — while still letting legacy ``close()``
+        call sites return their reference instead of leaking it.
         """
+        if getattr(self, "_shared_registry_owned", False):
+            from hermes_state_registry import release
+
+            release(self)
+            return
         self._stop_token_writer()
         hook, self._token_atexit_hook = self._token_atexit_hook, None
         if hook is not None:
@@ -7860,6 +8171,45 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         self._execute_write(_do)
 
+    def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:
+        """Advance this peer's conversation generation past a boundary.
+
+        Called inside the transaction that writes the boundary, so the
+        generation and the ``end_reason`` that caused it commit together.
+
+        Only ``_RESET_END_REASONS`` count: ``compression`` continues one
+        conversation, and an accidental close is not a replacement.  Rows with
+        no ``session_key`` have no routing peer to advance.
+
+        The counter deliberately does NOT read the session rows.  An aggregate
+        over them (COUNT/MAX of boundaries) can return a pair it already
+        emitted once ``delete_session()`` or bulk pruning removes an ended row,
+        which would hand a new conversation a retired affinity identity.  This
+        value only ever increments, so a generation is never reused for a peer
+        even if every row behind it is gone.
+        """
+        if end_reason not in _RESET_END_REASONS:
+            return
+        row = conn.execute(
+            "SELECT source, session_key FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return
+        source = str(row["source"] or "").strip()
+        session_key = str(row["session_key"] or "").strip()
+        if not source or not session_key:
+            return
+        conn.execute(
+            """
+            INSERT INTO conversation_generations (source, session_key, generation)
+            VALUES (?, ?, 1)
+            ON CONFLICT(source, session_key) DO UPDATE
+                SET generation = conversation_generations.generation + 1
+            """,
+            (source, session_key),
+        )
+
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.
 
@@ -7871,11 +8221,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         intentionally need to re-end a closed session with a new reason.
         """
         def _do(conn):
-            conn.execute(
+            changed = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND ended_at IS NULL",
                 (time.time(), end_reason, session_id),
-            )
+            ).rowcount
+            # Only a boundary this call actually wrote advances the generation:
+            # the first end_reason wins, so a no-op must not rotate the peer.
+            if changed:
+                self._bump_conversation_generation(conn, session_id, end_reason)
         self._execute_write(_do)
 
     def reopen_session(self, session_id: str) -> None:
@@ -7946,6 +8300,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"OR end_reason IN ({_RECOVERABLE_END_REASONS_SQL}))",
                 (now, reason, session_id),
             )
+            # /new and the policy auto-resets promote rather than end_session,
+            # so the generation has to advance here too — in the same
+            # transaction as the boundary, and only when one was written.
+            if cursor.rowcount:
+                self._bump_conversation_generation(conn, session_id, reason)
             return cursor.rowcount
 
         try:
@@ -9965,57 +10324,54 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         max_idle_seconds: float,
         sources: Tuple[str, ...] = ("tui", "desktop", "subagent"),
         exclude_ids: Tuple[str, ...] = (),
+        exclude_pinned: bool = False,
         heartbeat_staleness_seconds: Optional[float] = None,
         heartbeat_ownership_grace_seconds: Optional[float] = None,
+        respect_gateway_heartbeats: bool = True,
     ) -> List[str]:
         """Close session rows orphaned by a dead gateway process (#65194, #94895).
 
         The TUI/desktop gateway reaps disconnected websocket sessions with an
         in-process ``threading.Timer`` grace timer; a gateway restart destroys
-        the timer and leaves the row ``ended_at IS NULL`` forever.  This is
-        the startup-time complement: it closes rows for the given ``sources``
-        whose ``started_at`` AND newest ``messages.timestamp`` are both older
-        than ``max_idle_seconds``, with a distinct
+        the timer and leaves the row ``ended_at IS NULL`` forever. This is the
+        startup-time complement: it closes rows for the given ``sources`` whose
+        ``started_at`` and canonical last-activity time are both older than
+        ``max_idle_seconds``, with a distinct
         ``end_reason='startup_orphan_reap'`` for traceability.
 
-        Both timestamps must be stale on purpose: message recency alone would
-        sweep a freshly created compression/branch child carrying old copied
-        message timestamps, while ``started_at`` alone would sweep a
-        long-lived session that is still actively producing messages.
-        Message-less rows fall back to ``started_at`` via COALESCE.
+        Canonical activity is the newest of ``last_activity_at`` (the in-turn
+        heartbeat) and the newest durable message timestamp, falling back to
+        ``started_at``. The separate ``started_at`` predicate protects freshly
+        created compression/branch children whose copied activity is old.
 
-        Only pass sources owned by the local UI stack (never messaging-gateway
+        Only pass sources whose lifecycle the caller owns (never messaging-gateway
         platforms like ``telegram`` — ending those triggers the #60609 routing
-        loop).  ``exclude_ids`` spares rows this process still holds in
-        memory (a ``session.resume`` that landed during the startup grace
-        window).  Non-destructive: messages are preserved and the row remains
-        resumable.  First-reason-wins is preserved via ``ended_at IS NULL``.
+        loop). ``exclude_ids`` spares rows this process still holds in memory
+        (a ``session.resume`` that landed during the startup grace window).
+        ``exclude_pinned`` is intended for broad automatic sweeps; pinned rows
+        remain explicitly recoverable. Non-destructive: messages are preserved
+        and the row remains resumable. First-reason-wins is preserved via
+        ``ended_at IS NULL``.
 
-        Cross-backend liveness (#94895): when one ``state.db`` is shared by
-        N serve / gateway processes (isolated backends, fixed-port launchd
-        ``hermes serve``, desktop WS sidecar), each backend registers a row
-        in ``gateway_heartbeats`` refreshed every few seconds.  A row is
-        only reaped when ``started_at``/message staleness hold AND no live
-        backend (heartbeat refreshed within ``heartbeat_staleness_seconds``,
-        default ``2 * max_idle_seconds``) could plausibly own it.
+        Cross-backend liveness (#94895): when one ``state.db`` is shared by N
+        serve / gateway processes, each backend refreshes a row in
+        ``gateway_heartbeats``. With ``respect_gateway_heartbeats`` enabled, a
+        row is only reaped when activity staleness holds AND no live backend
+        (heartbeat refreshed within ``heartbeat_staleness_seconds``, default
+        ``2 * max_idle_seconds``) could plausibly own it. Disable that gate only
+        for sources whose lifecycle is explicitly owned by state.db itself.
 
         Ownership inference: a live backend B ``owns`` a session S if
         ``B.started_at <= S.started_at + heartbeat_ownership_grace_seconds``
-        (default ``heartbeat_staleness_seconds``).  The grace window
-        accommodates the deploy-time migration case where a backend just
-        wrote its first heartbeat row while its existing open sessions
-        predate the schema.  The grace is bounded by the staleness window
-        so a fresh PID-reuse respawn cannot indefinitely protect sessions
-        inherited from a dead predecessor.
+        (default ``heartbeat_staleness_seconds``). The grace window covers a
+        migrating backend whose existing sessions predate its first heartbeat,
+        but is bounded so a fresh PID-reuse respawn cannot protect rows forever.
+        With no fresh heartbeat the predicate falls back to the legacy sweep.
 
-        When NO backend has ever written a heartbeat (legacy deployment
-        mid-upgrade before any process has registered) the predicate falls
-        back to the original behavior so we never silently strand a row
-        that pre-dates the schema.
-
-        The SELECT + UPDATE run in one ``BEGIN IMMEDIATE`` write, so a sibling
-        process cannot sneak a new message or end-reason between the
-        staleness check and the close.  Returns the swept session ids.
+        The SELECT, live-lease validation, and UPDATE run in one
+        ``BEGIN IMMEDIATE`` transaction. Active turn leases or compression
+        locks spare the row; expired/reclaimed guards are removed so their
+        former owner is fenced. Returns the swept session ids.
         """
         srcs = tuple(s for s in sources if s)
         if max_idle_seconds <= 0 or not srcs:
@@ -10027,56 +10383,76 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         hb_grace = (
             heartbeat_ownership_grace_seconds
-            if heartbeat_ownership_grace_seconds and heartbeat_ownership_grace_seconds >= 0
+            if heartbeat_ownership_grace_seconds is not None
+            and heartbeat_ownership_grace_seconds >= 0
             else hb_staleness
         )
-        cutoff = time.time() - max_idle_seconds
-        hb_cutoff = time.time() - hb_staleness
+        now = time.time()
+        cutoff = now - max_idle_seconds
+        hb_cutoff = now - hb_staleness
         placeholders = ",".join("?" for _ in srcs)
         staleness = (
-            "started_at < ? AND COALESCE((SELECT MAX(m.timestamp) FROM messages m"
-            " WHERE m.session_id = sessions.id), started_at) < ?"
+            f"started_at < ? AND {_sql_session_last_active('sessions')} < ?"
         )
-
-        def _do(conn):
-            # Cross-process liveness gate (#94895). A session is "owned by
-            # a live backend" if any row in gateway_heartbeats is fresh
-            # (last_heartbeat >= hb_cutoff) AND was alive no later than
-            # ``sessions.started_at + hb_grace`` (heartbeats.started_at <=
-            # sessions.started_at + hb_grace). If at least one live backend
-            # matches, the row is not orphaned.
-            #
-            # ``hb_cutoff`` and ``hb_grace`` are computed above so all
-            # backends running concurrent sweep queries agree on the same
-            # boundaries. We do NOT clear heartbeats here — that's each
-            # backend's atexit responsibility via ``clear_backend_heartbeat``.
-            orphan_predicate = (
-                f"{staleness} AND NOT EXISTS ("
+        pin_scope = " AND COALESCE(pinned, 0) = 0" if exclude_pinned else ""
+        heartbeat_params: Tuple[float, ...] = ()
+        orphan_predicate = staleness
+        if respect_gateway_heartbeats:
+            orphan_predicate += (
+                " AND NOT EXISTS ("
                 "SELECT 1 FROM gateway_heartbeats h"
                 " WHERE h.last_heartbeat >= ?"
-                f" AND h.started_at <= sessions.started_at + ?"
+                " AND h.started_at <= sessions.started_at + ?"
                 ")"
             )
+            heartbeat_params = (hb_cutoff, hb_grace)
+
+        def _do(conn):
             rows = conn.execute(
                 f"SELECT id FROM sessions WHERE ended_at IS NULL"
-                f" AND source IN ({placeholders}) AND {orphan_predicate}",
-                (*srcs, cutoff, cutoff, hb_cutoff, hb_grace),
+                f" AND source IN ({placeholders}){pin_scope}"
+                f" AND {orphan_predicate}",
+                (*srcs, cutoff, cutoff, *heartbeat_params),
             ).fetchall()
             excluded = {str(x) for x in exclude_ids if x}
-            victims = [str(r["id"]) for r in rows if str(r["id"]) not in excluded]
+            victims = []
+            for row in rows:
+                sid = str(row["id"])
+                if sid in excluded:
+                    continue
+                try:
+                    self._check_transcript_write_guards(
+                        conn,
+                        sid,
+                        compression_lock_holder=None,
+                        turn_lease_holder=None,
+                        reject_active_turn_lease=True,
+                        reject_active_compression_lock=True,
+                    )
+                except (
+                    SessionCompressionInProgressError,
+                    SessionTurnLeaseLostError,
+                ):
+                    continue
+                victims.append(sid)
             if not victims:
                 return []
-            now = time.time()
+            closed_at = time.time()
             marks = ",".join("?" for _ in victims)
-            # Re-apply the same predicates under the write lock so a
-            # row that raced to activity between SELECT and UPDATE is
-            # spared (and so a freshly registered heartbeat from a sibling
-            # that started during this transaction can still save the row).
+            # Re-apply every scope/liveness predicate under the write lock.
             conn.execute(
                 f"UPDATE sessions SET ended_at = ?, end_reason = 'startup_orphan_reap'"
                 f" WHERE id IN ({marks}) AND ended_at IS NULL"
+                f" AND source IN ({placeholders}){pin_scope}"
                 f" AND {orphan_predicate}",
-                (now, *victims, cutoff, cutoff, hb_cutoff, hb_grace),
+                (
+                    closed_at,
+                    *victims,
+                    *srcs,
+                    cutoff,
+                    cutoff,
+                    *heartbeat_params,
+                ),
             )
             return victims
 
@@ -11586,6 +11962,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         turn_lease_ttl_seconds: float = 300.0,
         reject_active_turn_lease: bool = False,
         reject_active_compression_lock: bool = False,
+        allow_closed_compression_parent: bool = False,
     ) -> None:
         """Transcript-write admission checks, run INSIDE the write txn.
 
@@ -11685,6 +12062,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             session is not None
             and session["ended_at"] is not None
             and session["end_reason"] == "compression"
+            and not allow_closed_compression_parent
         ):
             raise CompressionSessionClosedError(session_id)
 
@@ -13322,11 +13700,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         halves the resume's DB work versus two separate calls, with byte-identical
         output (see test_get_resume_conversations_matches_separate_reads).
         """
-        session_ids = (
-            [session_id]
-            if self._is_explicit_branch_session(session_id)
-            else self._session_lineage_root_to_tip(session_id)
-        )
+        session_ids = self._resume_lineage_ids(session_id)
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
@@ -13362,9 +13736,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         )
         return model_history, display_history
 
-    def get_resume_message_count(self, session_id: str) -> int:
-        """Count active rows that a full resume would materialize."""
-        session_ids = self._session_lineage_root_to_tip(session_id)
+    def _resume_lineage_ids(self, session_id: str) -> List[str]:
+        """Session ids a full (display) resume materializes for *session_id*.
+
+        Compression continuations need their ended ancestors' rows for the
+        display transcript; an explicit ``/branch`` copy already owns its
+        transcript, so its lineage is itself alone. This is the ONE definition
+        shared by the resume readers (``get_resume_conversations``,
+        ``get_ancestor_display_prefix``) and the resume guard
+        (``assert_resume_safe`` / ``get_resume_message_count``) — the guard must
+        count exactly the rows a resume would load, never a superset.
+        """
+        if self._is_explicit_branch_session(session_id):
+            return [session_id]
+        return self._session_lineage_root_to_tip(session_id)
+
+    def get_resume_message_count(
+        self, session_id: str, *, tip_only: bool = False
+    ) -> int:
+        """Count active rows that a resume would materialize.
+
+        ``tip_only=True`` counts only the tip segment — the set a model-history
+        restore loads (``get_messages_as_conversation`` without ancestors, or
+        the deferred Desktop resume that pages the display transcript over
+        REST and never materializes the ancestor prefix in memory).
+        """
+        session_ids = [session_id] if tip_only else self._resume_lineage_ids(session_id)
         placeholders = ",".join("?" for _ in session_ids)
         with self._read_ctx() as conn:
             row = conn.execute(
@@ -13378,12 +13775,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         max_messages: Optional[int] = None,
+        *,
+        tip_only: bool = False,
     ) -> int:
         """Return resume row count or reject a transcript too large to load.
 
         ``max_messages=None`` resolves the limit from config
         (``sessions.max_resume_messages``); 0 disables the guard and returns
         the (bounded) count without raising.
+
+        ``tip_only=True`` bounds only the tip segment, for callers that never
+        materialize the ancestor lineage in memory (tip-only model restore,
+        deferred Desktop resume whose display history is REST-paginated). A
+        heavily-compressed conversation — 85 compaction segments and ~29k
+        lineage rows behind a ~700-row tip — is exactly the shape compression
+        is supposed to produce; counting its whole lineage against a limit
+        sized for in-memory materialization rejected the healthiest sessions
+        (Desktop Bot Chat stuck on "Waking up…" with code 4130) while the
+        process would only ever have held the tip.
         """
         if max_messages is None:
             max_messages = resolved_max_resume_messages()
@@ -13395,7 +13804,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # return value, and an unbounded lineage COUNT here would do the
             # exact pathological work the disable exists to avoid.
             return 0
-        session_ids = self._session_lineage_root_to_tip(session_id)
+        session_ids = [session_id] if tip_only else self._resume_lineage_ids(session_id)
         placeholders = ",".join("?" for _ in session_ids)
         with self._read_ctx() as conn:
             row = conn.execute(
@@ -13407,7 +13816,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         message_count = int(row[0] if row else 0)
         if message_count > max_messages:
-            raise SessionResumeTooLargeError(message_count, max_messages)
+            raise SessionResumeTooLargeError(
+                message_count,
+                max_messages,
+                scope="in its tip segment" if tip_only else "across its lineage",
+            )
         return message_count
 
     def assert_export_safe(
@@ -13466,10 +13879,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         returns ONLY the genuine ancestor messages, identified by
         ``session_id != tip_session_id``. (#65919)
         """
-        if self._is_explicit_branch_session(session_id):
-            return []
-
-        session_ids = self._session_lineage_root_to_tip(session_id)
+        session_ids = self._resume_lineage_ids(session_id)
         if len(session_ids) <= 1:
             return []
         with self._read_ctx() as conn:
@@ -14123,6 +14533,96 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return branched == parent_id or delegated == parent_id
         return branched is not None or delegated is not None
 
+    def is_explicit_fork_child(self, session_id: str) -> bool:
+        """True when ``session_id`` is a /branch, delegate, or tool child row.
+
+        Read-only public view of :meth:`_is_explicit_fork_child_row` for
+        callers that must respect the fork boundary without re-implementing
+        its marker rules (``agent/prompt_cache_scope.py`` keeps a declared
+        conversation key from crossing it). A missing row is not a fork.
+        """
+        session = self.get_session(session_id)
+        return bool(session and self._is_explicit_fork_child_row(session))
+
+    def declared_scope_identity(self, session_id: str) -> Tuple[bool, str]:
+        """Fork verdict and recorded ``source`` for *session_id*, in ONE read.
+
+        ``agent/prompt_cache_scope.py`` needs both to resolve a host-declared
+        conversation scope, and both live on the same ``sessions`` row; asking
+        for them separately read that row twice per resolution (@teknium1 on
+        #98811).  The marker rules stay here, beside
+        :meth:`is_explicit_fork_child`, instead of being re-implemented by the
+        caller.
+
+        A missing row is not a fork and has no source, which is the right
+        answer before ``_ensure_db_session`` persists it.  This raises whatever
+        :meth:`get_session` raises: the caller fails closed on a DB error, and
+        merging the two reads cannot weaken that, because the fork check was
+        already the first of the two.
+        """
+        session = self.get_session(session_id)
+        if not session:
+            return False, ""
+        return (
+            self._is_explicit_fork_child_row(session),
+            str(session.get("source") or "").strip(),
+        )
+
+    def latest_conversation_boundary(
+        self, session_key: str, source: str
+    ) -> Optional[int]:
+        """How many conversation boundaries this routing peer has crossed.
+
+        A boundary is a row this peer ended at an intentional conversation
+        break — the ``_RESET_END_REASONS`` set (``/new``, ``/switch``, idle,
+        daily, suspended, resume_pending_expired).  That is the same fence
+        :meth:`find_latest_gateway_session_for_peer` refuses to reach behind,
+        so the two agree on where one conversation stops and the next begins
+        and cannot drift.
+
+        The peer is ``(session_key, source)``, the SAME identity tuple recovery
+        uses — never the key alone.  ``X-Hermes-Session-Key`` accepts any
+        authenticated caller-supplied string, so an API conversation may
+        legally carry the same key as a Telegram row in one database; keying
+        on the string alone would let a ``/new`` on that unrelated row rotate
+        this conversation's affinity identity while recovery correctly refuses
+        to cross the same line.
+
+        Returns the count, or ``None`` when this peer has never been reset.
+
+        The value comes from ``conversation_generations``, which
+        :meth:`_bump_conversation_generation` advances inside the transaction
+        that writes each boundary — NOT from an aggregate over the session
+        rows.  An aggregate cannot prove non-reuse: ``delete_session()``
+        orphans children and deletes the row, and bulk prune selects ended
+        rows, so ``COUNT``/``MAX`` over boundaries can return a pair it already
+        emitted and hand a new conversation a retired affinity identity.  It is
+        also wall-clock-free, so a backwards NTP correction cannot reorder it.
+
+        Databases upgraded mid-conversation start at no generation and take
+        their first one from the next boundary written; a conversation that
+        reset before the upgrade shares its predecessor's scope once, which
+        costs a warm prompt-cache bucket and never crosses an identity.
+
+        These rows are never garbage-collected, by design: dropping one resets
+        the peer to "no generation", so its next boundary writes ``1`` again
+        and re-issues a scope a retired conversation already used — the ABA
+        this counter exists to prevent.  See the schema comment in
+        ``hermes_state_common.py``.
+        """
+        if not session_key or not source:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT generation FROM conversation_generations "
+                "WHERE source = ? AND session_key = ?",
+                (source, session_key),
+            ).fetchone()
+        if row is None or row["generation"] is None:
+            return None
+        generation = int(row["generation"])
+        return generation if generation > 0 else None
+
     def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:
         parent_id = child.get("parent_session_id")
         if not parent_id or self._is_explicit_fork_child_row(child):
@@ -14589,6 +15089,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    ) < ?"""
             )
             params.append(last_active_before)
+            # An automatic orphan sweep closes a stale open row so the user can
+            # still recover it. Age those rows from the sweep, not from their old
+            # activity, or the next prune pass can delete them immediately.
+            clauses.append(
+                "(COALESCE(s.end_reason, '') != 'startup_orphan_reap' "
+                "OR s.ended_at < ?)"
+            )
+            params.append(last_active_before)
         if last_active_after is not None:
             clauses.append(
                 """COALESCE(
@@ -14850,6 +15358,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         older_than_days: Optional[float] = 90,
         source: str = None,
         sessions_dir: Optional[Path] = None,
+        exclude_active_write_guards: bool = False,
         **filters,
     ) -> int:
         """Delete sessions matching the filters. Returns count deleted.
@@ -14887,6 +15396,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         on-disk transcript files (``.json`` / ``.jsonl`` /
         ``request_dump_*``) for every pruned session, outside the DB
         transaction.
+
+        ``exclude_active_write_guards`` is for destructive automatic
+        maintenance: rows protected by a live turn lease or compression lock
+        are skipped, while expired or provably dead holders are reclaimed and
+        fenced in the same write transaction.
         """
         self._apply_prune_age_filter(older_than_days, filters)
         where, where_params = self._prune_filter_where(source=source, **filters)
@@ -14897,6 +15411,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"SELECT s.id FROM sessions s WHERE {where}", where_params
             )
             session_ids = {row["id"] for row in cursor.fetchall()}
+
+            if exclude_active_write_guards:
+                protected = set()
+                for sid in session_ids:
+                    try:
+                        self._check_transcript_write_guards(
+                            conn,
+                            sid,
+                            compression_lock_holder=None,
+                            turn_lease_holder=None,
+                            reject_active_turn_lease=True,
+                            reject_active_compression_lock=True,
+                            allow_closed_compression_parent=True,
+                        )
+                    except (
+                        SessionCompressionInProgressError,
+                        SessionTurnLeaseLostError,
+                    ):
+                        protected.add(sid)
+                session_ids.difference_update(protected)
 
             if not session_ids:
                 return 0
@@ -15739,16 +16273,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (``.json`` / ``.jsonl`` / ``request_dump_*``) for pruned sessions
         are removed as part of the same sweep (issue #3015).
 
+        Stale-open reconciliation (#54189): several state-owned producers
+        (cron, kanban workers, subagents, one-shot CLI runs) never set
+        ``ended_at`` when their process dies, and ``prune_sessions`` only
+        deletes ended rows — so retention was a no-op exactly where growth
+        concentrates. After pruning, this pass closes open rows from
+        :attr:`_AUTO_PRUNE_STALE_OPEN_SOURCES` whose activity is older than
+        ``retention_days`` (``end_reason='startup_orphan_reap'``). Closed rows
+        stay resumable and are aged from their close, so they get one more
+        full retention window before a later pass deletes them. Messaging
+        and UI sources are never touched here.
+
         Never raises. On any failure, logs a warning and returns a dict
         with ``"error"`` set.
 
         Returns a dict with keys:
           - ``"skipped"`` (bool) — true if within min_interval_hours of last run
           - ``"pruned"`` (int)   — number of sessions deleted
+          - ``"closed"`` (int)   — stale open state-owned sessions marked ended
           - ``"vacuumed"`` (bool) — true if VACUUM ran
           - ``"error"`` (str, optional) — present only on failure
         """
-        result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
+        result: Dict[str, Any] = {
+            "skipped": False,
+            "pruned": 0,
+            "closed": 0,
+            "vacuumed": False,
+        }
+        maintenance_lock = _try_acquire_auto_maintenance_lock(self.db_path)
+        if maintenance_lock is None:
+            result["skipped"] = True
+            return result
         try:
             # Skip if another process/call did maintenance recently.
             last_raw = self.get_meta("last_auto_prune")
@@ -15762,12 +16317,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 except (TypeError, ValueError):
                     pass  # corrupt meta; treat as no prior run
 
+            # Delete only sessions that were already explicitly closed. A
+            # startup orphan discovered by this pass is closed *after* pruning,
+            # preserving a full retention window in which it can be resumed.
             pruned = self.prune_sessions(
                 older_than_days=retention_days,
                 sessions_dir=sessions_dir,
+                exclude_active_write_guards=True,
             )
             result["pruned"] = pruned
 
+            # Reap stale state-owned rows only. Runtime-owned messaging sources
+            # are intentionally outside this automatic destructive scope.
+            closed = self.sweep_orphaned_sessions(
+                max_idle_seconds=float(retention_days) * 86400.0,
+                sources=self._AUTO_PRUNE_STALE_OPEN_SOURCES,
+                exclude_pinned=True,
+                # These sources are owned by state.db lifecycles, not by the
+                # dashboard/TUI gateway heartbeats used by startup recovery.
+                respect_gateway_heartbeats=False,
+            )
+            result["closed"] = len(closed)
             # Only VACUUM if we actually freed rows, and no more often than
             # once every min_vacuum_interval_days -- a large prune (e.g. the
             # first one to cross retention_days on a DB with tens of
@@ -15794,9 +16364,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # every startup within the min_interval_hours window.
             self.set_meta("last_auto_prune", str(now))
 
-            if pruned > 0:
+            if closed or pruned > 0:
                 logger.info(
-                    "state.db auto-maintenance: pruned %d session(s) inactive for %d days%s",
+                    "state.db auto-maintenance: closed %d stale open session(s), "
+                    "pruned %d session(s) inactive for %d days%s",
+                    len(closed),
                     pruned,
                     retention_days,
                     " + VACUUM" if result["vacuumed"] else "",
@@ -15805,6 +16377,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # Maintenance must never block startup. Log and return error marker.
             logger.warning("state.db auto-maintenance failed: %s", exc)
             result["error"] = str(exc)
+        finally:
+            _release_auto_maintenance_lock(maintenance_lock)
 
         return result
 

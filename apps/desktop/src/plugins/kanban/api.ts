@@ -26,6 +26,7 @@ import type {
   BoardMeta,
   BoardsResponse,
   KanbanBoard,
+  KanbanDiagnosticsResult,
   KanbanProfile,
   KanbanProject,
   KanbanTask,
@@ -176,6 +177,12 @@ export const fetchTask = (id: string) => call<KanbanTaskDetail>(withBoard(`/task
 
 /** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */
 export const fetchLog = (id: string) => call<WorkerLog>(withBoard(`/tasks/${id}/log`, { tail: '16384' }))
+
+/** Fleet-wide active diagnostics (read-only engine run). Powers the
+ *  "Diagnostiquer le dispatcher" action — a real diagnostic pass over the
+ *  board, not a CLI copy hint. */
+export const fetchDiagnostics = () =>
+  call<KanbanDiagnosticsResult>(withBoard('/diagnostics'))
 
 export const fetchBoards = () => call<BoardsResponse>('/boards')
 

@@ -534,6 +534,8 @@ export const en: Translations = {
     copyCliCommand: "Copy CLI command (for external / fallback)",
     connect: "Connect",
     sessionExpires: "Session expires in {time}",
+    sessionExpiredNoError:
+      "Sign-in expired without reaching the provider. This usually means the sign-in page stalled in the opened tab (server-side issue) — finish signing in there, then click Retry. If it keeps failing, use an API key or the CLI fallback instead.",
     initiatingLogin: "Initiating login flow…",
     exchangingCode: "Exchanging code for tokens…",
     connectedClosing: "Connected! Closing…",
@@ -755,7 +757,7 @@ export const en: Translations = {
     hide: "Hide",
     show: "Show",
     attention: "Attention",
-    tasksNeedAttention: "tasks need attention",
+    tasksNeedAttention: "{n} tasks need attention",
     taskNeedsAttention: "1 task needs attention",
     diagnostic: "diagnostic",
     open: "Open",

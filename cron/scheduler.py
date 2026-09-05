@@ -77,7 +77,8 @@ def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
     try:
         db = future.result()
         if db is not None:
-            db.close()
+            from hermes_state import release_or_close
+            release_or_close(db)
     except Exception:
         pass
 
@@ -2983,7 +2984,7 @@ def _send_media_via_adapter(
     return errors
 
 
-def _confirm_adapter_delivery(send_result) -> bool:
+def _confirm_adapter_delivery(send_result, job_id: str = "?", unverified: Optional[list] = None) -> bool:
     """Return True only if ``send_result`` unambiguously confirms delivery.
 
     A live adapter that returns ``None`` (e.g. a swallowed exception, a busy
@@ -2992,16 +2993,54 @@ def _confirm_adapter_delivery(send_result) -> bool:
     scheduler to log ``"delivered to <chat> via live adapter"`` while the
     gateway never actually sees the message (#47056).
 
-    Likewise, an object missing a ``success`` attribute (e.g. a bare ``dict``
-    or a partial mock) is a contract violation: it does not actually tell us
-    whether the send succeeded.  Require an explicit, truthy ``success``
-    attribute to count as confirmed.
+    Likewise, a result carrying no ``success`` at all (a partial mock, or a
+    ``dict`` from a code path that never reached the adapter) is a contract
+    violation: it does not actually tell us whether the send succeeded.
+    Require an explicit, truthy ``success`` to count as confirmed.
+
+    Both shapes are inspected the same way, because ``_deliver_to_platform``
+    returns either a ``SendResult`` object or a plain ``dict``:
+
+    * ``delivered is False`` is a REJECTION even when ``success`` is truthy.
+      The silence-narration filter returns
+      ``{"success": True, "delivered": False}`` — a successfully *dropped*
+      message, not a delivered one.  Reading only ``success`` there is how a
+      cron brief was logged as delivered while the user got nothing (#77763).
+    * No ``message_id`` and no ``raw_response`` means we have no positive
+      evidence of a send.  That is not proof of failure either (some adapters
+      legitimately return a bare success), so it is still accepted — but
+      logged at WARNING so an UNVERIFIED delivery is visible in the log
+      instead of masquerading as a confirmed one.  Telegram ``SendResult``
+      objects carry ``message_id``; the dict-filter shape does not.
     """
     if send_result is None:
         return False
-    if not hasattr(send_result, "success"):
+    if isinstance(send_result, dict):
+        if "success" not in send_result:
+            return False
+        success = bool(send_result.get("success"))
+        delivered = send_result.get("delivered")
+        message_id = send_result.get("message_id")
+        raw_response = send_result.get("raw_response")
+    else:
+        if not hasattr(send_result, "success"):
+            return False
+        success = bool(getattr(send_result, "success"))
+        delivered = getattr(send_result, "delivered", None)
+        message_id = getattr(send_result, "message_id", None)
+        raw_response = getattr(send_result, "raw_response", None)
+    if not success or delivered is False:
         return False
-    return bool(getattr(send_result, "success"))
+    if message_id is None and not raw_response:
+        logger.warning(
+            "Job '%s': live adapter reported success with no delivery evidence "
+            "(no message_id, no raw_response) — treating as delivered but "
+            "UNVERIFIED",
+            job_id,
+        )
+        if unverified is not None:
+            unverified.append(True)
+    return True
 
 
 def _is_channel_dm_topic(
@@ -3060,6 +3099,48 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _cron_delivery_notify_enabled(cfg: Optional[dict]) -> bool:
+    """Resolve ``cron.delivery.notify`` (config.yaml). Default True.
+
+    Only an explicit boolean ``False`` (or a YAML ``false``/``off`` that parses
+    to it) disables the push notification; a missing/malformed section keeps
+    the default so a typo can never silently make cron briefs silent.
+    """
+    try:
+        cron_cfg = (cfg or {}).get("cron")
+        if not isinstance(cron_cfg, dict):
+            return True
+        delivery_cfg = cron_cfg.get("delivery")
+        if not isinstance(delivery_cfg, dict):
+            return True
+        return delivery_cfg.get("notify", True) is not False
+    except Exception:
+        return True
+
+
+def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
+    """Persist the UNVERIFIED-delivery marker on the job record.
+
+    ``last_delivery_unverified`` is a list of ``platform:chat_id`` targets
+    whose live adapter acked the send with no message_id/raw_response, or
+    ``None`` once a run delivered with positive evidence (or to no live
+    target). Skips the write when nothing changed so the common verified
+    path costs no jobs.json save. Never raises — status bookkeeping must not
+    fail a delivery.
+    """
+    new_value = list(unverified_targets) or None
+    if (job.get("last_delivery_unverified") or None) == new_value:
+        return
+    try:
+        from cron.jobs import update_job
+
+        update_job(job["id"], {"last_delivery_unverified": new_value})
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "Job '%s': could not record delivery verification: %s", job.get("id"), exc,
+        )
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -3106,6 +3187,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     except Exception:
         pass
+
+    # cron.delivery.notify (default True): mark live-adapter cron sends as
+    # FINAL notifications so the platform pushes them (Telegram's "important"
+    # mode otherwise sends with disable_notification=True). Configurable so
+    # operators who prefer silent briefs can opt back out.
+    notify_delivery = _cron_delivery_notify_enabled(user_cfg)
+    # Set when a live adapter acked a send with NO delivery evidence (no
+    # message_id / raw_response — the Slack/Matrix/Mattermost bare
+    # SendResult(success=True) shape). Persisted on the job as
+    # ``last_delivery_unverified`` so `hermes cron list` shows the state
+    # instead of it living only in a WARNING log line.
+    unverified_targets: list = []
 
     if wrap_response:
         task_name = job.get("name", job["id"])
@@ -3482,10 +3575,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata = {
                     "direct_messages_topic_id": str(thread_id),
                     "job_id": job["id"],
+                    "notify": notify_delivery,
                 }
                 # Media metadata mirrors the text routing so attachments land in
                 # the same DM topic instead of the General lane (#22773).
-                media_metadata = {"direct_messages_topic_id": str(thread_id)}
+                media_metadata = {
+                    "direct_messages_topic_id": str(thread_id),
+                    "notify": notify_delivery,
+                }
             else:
                 # Forum-style topic (private chat / supergroup) or non-topic
                 # target: route via message_thread_id (#52060).  Put thread_id in
@@ -3496,10 +3593,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # anchor, so the metadata key bypasses that check and lets the
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
-                route_metadata = {"job_id": job["id"]}
+                route_metadata = {"job_id": job["id"], "notify": notify_delivery}
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
-                media_metadata = {"thread_id": thread_id} if thread_id else None
+                media_metadata = {"notify": notify_delivery}
+                if thread_id:
+                    media_metadata["thread_id"] = thread_id
 
             # Relay egress needs a tenant discriminator on the frame: the
             # connector's fail-closed guard resolves the workspace/guild from
@@ -3529,7 +3628,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 adapter_ok = True
                 timed_out = False
                 delivered_message_id = None
-                if text_to_send:
+                if not text_to_send and not media_files:
+                    # Nothing to hand the adapter at all.  This used to fall
+                    # straight through to the `if adapter_ok:` branch below and
+                    # log "delivered to <chat> via live adapter" for a send that
+                    # never happened (#77763).  Fail closed so the run reports
+                    # the empty payload instead.
+                    msg = (
+                        f"live adapter send skipped (empty text and no media) "
+                        f"for {platform_name}:{chat_id}"
+                    )
+                    logger.warning("Job '%s': %s", job["id"], msg)
+                    target_errors.append(msg)
+                    adapter_ok = False
+                elif text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
                     router = DeliveryRouter(config, adapters)
@@ -3622,19 +3734,32 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             # {"success": True, "delivered": False, ...}.
                             # Normalize both shapes so a getattr default doesn't
                             # misread a dict, and so a None / success-less object
-                            # is NOT counted as delivered (#47056).
+                            # is NOT counted as delivered (#47056).  The
+                            # confirmation itself handles both shapes: a truthy
+                            # `success` with `delivered: False` is a drop, not a
+                            # delivery (#77763).
                             if isinstance(send_result, dict):
-                                send_success = bool(send_result.get("success", False))
                                 send_raw_response = send_result.get("raw_response")
                                 delivered_message_id = send_result.get("message_id")
                             else:
-                                send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
                                 delivered_message_id = getattr(send_result, "message_id", None)
+                            _evidence_gap: list = []
+                            send_success = _confirm_adapter_delivery(
+                                send_result, job["id"], _evidence_gap,
+                            )
+                            if send_success and _evidence_gap:
+                                unverified_targets.append(f"{platform_name}:{chat_id}")
 
                             if not send_success:
                                 if isinstance(send_result, dict):
-                                    err = send_result.get("error", "unknown")
+                                    # A filtered drop carries no "error" — name
+                                    # the filter instead of reporting "unknown".
+                                    err = (
+                                        send_result.get("error")
+                                        or send_result.get("filtered")
+                                        or "unknown"
+                                    )
                                     shape = "dict"
                                 elif send_result is not None:
                                     err = getattr(send_result, "error", None)
@@ -3711,7 +3836,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     delivery_errors.append(msg)
 
                 if adapter_ok:
-                    logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
+                    # Log WHERE it went, not just that it went: a ghost delivery
+                    # that landed in the wrong lane (General topic instead of the
+                    # routed thread) is indistinguishable from a real one without
+                    # the routing identity (#77763).
+                    logger.info(
+                        "Job '%s': delivered to %s:%s via live adapter thread=%s message_id=%s",
+                        job["id"], platform_name, chat_id,
+                        route_thread_id if route_thread_id is not None else "-",
+                        delivered_message_id if delivered_message_id is not None else "-",
+                    )
                     delivered = True
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
@@ -3825,6 +3959,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 target_errors.append(msg)
                 delivery_errors.extend(target_errors)
                 continue
+            # The live lane already failed closed on an empty payload; the
+            # standalone senders do not. The Telegram adapter returns
+            # SendResult(success=True) for empty content WITHOUT an API call,
+            # so falling through here turns a phantom live delivery into a
+            # phantom standalone one and logs it as delivered (#77763). Both
+            # _send_to_platform call sites below are reached through this
+            # point, so one guard closes the lane.
+            if not cleaned_delivery_content.strip() and not media_files:
+                msg = (
+                    f"standalone send skipped (empty text and no media) "
+                    f"for {platform_name}:{chat_id}"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                target_errors.append(msg)
+                delivery_errors.extend(target_errors)
+                continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
@@ -3914,6 +4064,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if policy_drop_errors:
         # Filter-time drops apply to every target; report them once.
         delivery_errors.extend(policy_drop_errors)
+    _record_delivery_verification(job, unverified_targets)
     if delivery_errors:
         return "; ".join(delivery_errors)
     return None
@@ -5509,6 +5660,24 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    # Fail closed on a corrupt config.yaml before any agent-driven work
+    # (issue #81952): a cron fire is fully non-interactive, and continuing
+    # on built-in defaults lets provider auto-detection adopt .env
+    # credentials the config never named, billing a provider the user did
+    # not choose. no_agent script jobs are exempt — they never construct an
+    # AIAgent or spend tokens. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
+    if not job.get("no_agent"):
+        from hermes_cli.config import (
+            InvalidUserConfigError,
+            require_parseable_user_config,
+        )
+
+        try:
+            require_parseable_user_config()
+        except InvalidUserConfigError as exc:
+            logger.error("Job '%s': refusing to run — %s", job_id, exc)
+            return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc))
+
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------
@@ -6381,7 +6550,7 @@ def run_job(
         # run forever.
         _session_db_timeout = _get_session_db_timeout()
         try:
-            from hermes_state import SessionDB
+            from hermes_state import get_shared_session_db
 
             if _session_db_timeout > 0:
                 _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -6392,7 +6561,7 @@ def run_job(
                 # silently falling back to the process-global default.
                 _session_db_context = contextvars.copy_context()
                 _session_db_future = _session_db_pool.submit(
-                    _session_db_context.run, SessionDB
+                    _session_db_context.run, get_shared_session_db
                 )
                 try:
                     _session_db = _session_db_future.result(timeout=_session_db_timeout)
@@ -6413,7 +6582,7 @@ def run_job(
                     _session_db_pool.shutdown(wait=False)
             else:
                 # 0 = unlimited (legacy behavior, opt-in for debugging)
-                _session_db = SessionDB()
+                _session_db = get_shared_session_db()
         except concurrent.futures.TimeoutError:
             logger.error(
                 "Job '%s': SessionDB init did not return within %.0fs — proceeding "
@@ -6908,7 +7077,8 @@ def run_job(
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
             try:
-                _session_db.close()
+                from hermes_state import release_or_close
+                release_or_close(_session_db)
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
         # Release subprocesses, terminal sandboxes, browser daemons, and the

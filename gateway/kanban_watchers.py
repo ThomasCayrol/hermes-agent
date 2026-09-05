@@ -225,9 +225,9 @@ class GatewayKanbanWatchersMixin:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
-        ``review_requested``, ``changes_requested``,
+        stored cursor with kind in the terminal/recovery set (``completed``,
+        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``, ``stale``,
+        ``auto_recovery``, ``review_requested``, ``changes_requested``,
         ``block_loop_detected``). Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
         then advances the cursor. The subscription is removed only when the
@@ -263,7 +263,11 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "stale", "auto_recovery", "status", "archived", "unblocked",
+            "block_loop_detected", "review_requested", "changes_requested",
+        )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -616,9 +620,32 @@ class GatewayKanbanWatchersMixin:
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
+                            operator_message = (
+                                str(ev.payload.get("operatorMessage"))
+                                if ev.payload and ev.payload.get("operatorMessage")
+                                else ""
+                            )
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"↻ {board_tag}{tag}Kanban {sub['task_id']} "
+                                f"{operator_message}"
+                                if operator_message
+                                else (
+                                    f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
+                                    f"(pid gone); dispatcher will retry"
+                                )
+                            )
+                        elif kind in {"stale", "auto_recovery"}:
+                            operator_message = (
+                                str(ev.payload.get("operatorMessage"))
+                                if ev.payload and ev.payload.get("operatorMessage")
+                                else (
+                                    "RÉCUPÉRATION AUTO — étape relancée; "
+                                    "aucune action opérateur requise."
+                                )
+                            )
+                            msg = (
+                                f"↻ {board_tag}{tag}Kanban {sub['task_id']} "
+                                f"{operator_message}"
                             )
                         elif kind == "timed_out":
                             limit = 0

@@ -470,6 +470,8 @@ export const fr: Translations = {
     copyCliCommand: "Copier la commande CLI (pour externe / repli)",
     connect: "Connecter",
     sessionExpires: "La session expire dans {time}",
+    sessionExpiredNoError:
+      "La connexion a expiré sans atteindre le fournisseur. Cela signifie généralement que la page de connexion est restée bloquée dans l'onglet ouvert (problème côté serveur) — terminez la connexion là-bas, puis cliquez sur Réessayer. Si le problème persiste, utilisez une clé API ou la CLI à la place.",
     initiatingLogin: "Lancement du flux de connexion…",
     exchangingCode: "Échange du code contre des jetons…",
     connectedClosing: "Connecté ! Fermeture…",
@@ -686,7 +688,7 @@ export const fr: Translations = {
     hide: "Masquer",
     show: "Afficher",
     attention: "Attention",
-    tasksNeedAttention: "tâches nécessitent une attention",
+    tasksNeedAttention: "{n} tâches nécessitent une attention",
     taskNeedsAttention: "1 tâche nécessite une attention",
     diagnostic: "diagnostic",
     open: "Ouvrir",
