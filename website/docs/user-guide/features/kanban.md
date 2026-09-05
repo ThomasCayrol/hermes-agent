@@ -592,9 +592,15 @@ dispatch tick (`kanban.dispatch_in_gateway`, default on). For every
 handoff, it:
 
 1. **Synthesizes** the mission snapshot from persisted board state: gate
-   verdict (read from the completed run summary / result — `ACCEPT` /
-   `REJECT` markers), active workers, unresolved blockers, and the git
-   state of the gate's `dir` workspace (dirty? committed? pushed?).
+   verdict (structured-first: run metadata `verdict`/`gate_outcome`, then
+   `task.result`, then only the opening verdict line of the run summary),
+   active workers, unresolved blockers, and the **git truth** of the gate's
+   `dir` workspace — probed with real `git` commands: full HEAD SHA, branch,
+   dirty (tracked + staged + untracked), committed (HEAD exists and the
+   workspace is clean), upstream/remote,
+   ahead/behind, remote SHA. `pushed` is true **only** when a remote ref
+   exists whose SHA equals the local HEAD SHA; a missing, stale, or
+   ambiguous remote (several remotes disagree) is never reported as pushed.
 2. **Resolves the next workflow** (`resolve_next_action`): a rejected gate
    → `REMEDIATION`; an accepted gate with a dirty tree →
    `DELIVERY_CHECKPOINT` (verify manifest → stage → review → commit →
@@ -609,6 +615,43 @@ Emission is **idempotent**: a second scan / restart / replay never
 duplicates the handoff (the marker comment is the dedup key). The handoff is
 persisted board-side, so a restarted session can reconstruct it without any
 chat history.
+
+**Repository policy wins over autonomy.** A repository that forbids commit
+or push without owner approval expresses that as per-action approvals in the
+persisted operator policy (`kanban.autonomy.approvals` in `config.yaml`).
+The natural verb keys (`commit`, `push`, `merge`) gate every workflow
+identity they alias — `DELIVERY_CHECKPOINT`, `COMMIT`, `PUSH`,
+`PUSH_CHECKPOINT`, `MERGE_MAIN`, `INTEGRATION_REVIEW` — **including on a
+feature branch**. A dirty accepted gate in such a repo therefore persists
+`DELIVERY_CHECKPOINT APPROVAL_REQUIRED` + `AWAITING_APPROVAL` and performs
+no Git mutation, even when branch context alone would otherwise classify the
+checkpoint AUTO.
+
+**Execution witness rule (no invented continuations).** An AUTO decision is
+persisted as AUTO/STARTING only when the caller supplies a **real execution
+witness/materialization record** — an existing `task_runs` row created by an
+executor that actually claimed/started the work. The resolver's AUTO verdict
+or a would-be `auto_continue` event is never, by itself, persisted as
+executed intent: without a witness the handoff **fails closed** to
+`APPROVAL_REQUIRED` + `AWAITING_APPROVAL` and records no `auto_continue`
+event. The gateway/CLI dispatch paths carry no executor, so their AUTO
+decisions stop for the operator; a caller that has genuinely materialized
+the action passes the witness (today only a direct Python call to
+`emit_terminal_handoff(..., execution_witness=...)` — the CLI/gateway do
+not expose it) and keeps STARTING.
+
+**STARTING watchdog.** A bounded, idempotent watchdog runs on the same
+dispatch tick. STARTING auto-continuations whose recorded execution run is
+missing, ended/crashed, or whose claim/heartbeat expired are corrected with
+a `terminal_handoff_watchdog` event + comment to `APPROVAL_REQUIRED` /
+`AWAITING_APPROVAL` — exactly once per handoff event.
+
+**Reconciliation.** Re-running the handoff (`hermes kanban handoff <gate-id>
+--recompute`) re-derives the snapshot from current persisted state and
+appends a corrective RECOMPUTED handoff whenever the structured verdict, the
+resolved next-action type, **or the derived repo-state git fields** moved.
+Historical prose in comments/results can never override the structured
+verdict or current git truth.
 
 ### Manual scan
 
@@ -625,6 +668,19 @@ push, and merge remain approval-gated — the emitted comment states
 `Approval required: YES — awaiting user approval` when the recommended next
 workflow contains such a step. Nothing in the observer stages, commits,
 pushes, or merges.
+
+When an accepted dirty gate needs a delivery decision (repository policy or
+a protected/canonical branch), the approval handoff carries an explicit
+waiting block so the owner sees the state at a glance:
+
+```
+LIVRAISON EN ATTENTE — gate accepted; changes remain uncommitted; no remote
+update was performed. Commit/push require explicit owner authorization; this
+handoff performed no Git mutation.
+RECOMMENDED OWNER DECISION: APPROVE DELIVERY CHECKPOINT
+Ready prompt (owner): approve the delivery checkpoint to stage, commit, and
+push the accepted candidate.
+```
 
 ### Duplicate-work prevention
 

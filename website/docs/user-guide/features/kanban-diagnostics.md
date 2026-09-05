@@ -115,7 +115,7 @@ command is only a secondary affordance (discreet copy icon). New engine kinds:
 `run_diagnostics` (**Diagnostiquer le dispatcher** — executes a real read-only
 diagnostics run, replacing the old “Check dispatcher status” copy hint),
 `view_worker` (**Voir le worker actif**), `view_queue` (**Voir la file
-{profile}**). Existing real actions: `reclaim` (Récupérer la tâche),
+\{profile\}**). Existing real actions: `reclaim` (Récupérer la tâche),
 `reassign` (Réassigner), `unblock` (Débloquer), `comment` (Ajouter un
 commentaire), `open_docs`, `cli_hint` (secondary only).
 

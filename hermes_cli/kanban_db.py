@@ -5314,9 +5314,26 @@ def gate_verdict(conn: sqlite3.Connection, gate: Task) -> Optional[bool]:
 def repo_state_for(task: Optional[Task]) -> dict:
     """Probe the git state of a task's dir workspace (best-effort).
 
-    Returns a dict with ``dirty`` / ``committed`` / ``pushed`` booleans and
-    ``branch``/``head`` when the workspace is a git repo. Any failure returns
-    ``{}`` so the caller can degrade to an approval-required recommendation.
+    Returns structured Git truth derived from actual ``git`` commands:
+
+    - ``head`` — the FULL 40-char HEAD SHA (``None`` on an unborn branch).
+    - ``branch`` — current branch (``None`` when detached / unidentifiable).
+    - ``dirty`` — any unstaged, staged, or untracked change
+      (``git status --porcelain``).
+    - ``committed`` — a validated HEAD commit exists and the workspace is clean.
+    - ``upstream`` / ``remote`` / ``remote_head`` — the configured upstream
+      (``@{u}``) when present; without an upstream, the single remote-
+      tracking ref whose branch portion matches the current branch.
+    - ``ahead`` / ``behind`` — left-right counts against the comparison ref.
+    - ``pushed`` — True ONLY when a remote-tracking ref exists whose SHA
+      equals the local HEAD SHA. Missing remote, probe error, or ambiguous
+      remote evidence (several remotes disagree) => False / unknown, never
+      True.
+    - ``unpushed_commits`` — local commits not present on any remote ref
+      (fallback used when no comparison ref exists).
+
+    Any failure returns ``{}`` so the caller can degrade to an
+    approval-required recommendation.
     """
     if (
         task is None
@@ -5330,34 +5347,128 @@ def repo_state_for(task: Optional[Task]) -> dict:
     try:
         import subprocess
 
-        def _git(*args: str) -> str:
-            out = subprocess.run(
+        def _run(*args: str):
+            return subprocess.run(
                 ["git", "-C", str(ws), *args],
                 capture_output=True, text=True, timeout=10,
             )
-            return out.stdout.strip()
 
-        head = _git("rev-parse", "--short", "HEAD")
-        branch = _git("rev-parse", "--abbrev-ref", "HEAD")
-        dirty = bool(_git("status", "--porcelain"))
-        # Count unpushed commits without rev-list @{u} syntax edge cases.
-        ahead = _git("rev-list", "--count", "HEAD", "--not", "--remotes")
-        last_commit = _git("log", "-1", "--format=%ct")
+        head_r = _run("rev-parse", "HEAD")
+        head = head_r.stdout.strip() if head_r.returncode == 0 else ""
+
+        branch_raw = ""
+        branch_r = _run("rev-parse", "--abbrev-ref", "HEAD")
+        if branch_r.returncode == 0:
+            branch_raw = branch_r.stdout.strip()
+        # Detached HEAD reports the literal ref name "HEAD" — not a branch.
+        branch = None if not branch_raw or branch_raw == "HEAD" else branch_raw
+
+        dirty = bool(_run("status", "--porcelain").stdout.strip())
+        # A dirty workspace has no committed delivery state: HEAD may exist,
+        # but the candidate represented by this workspace is not committed.
+        committed = bool(head) and not dirty
+
+        # Remote truth. Enumerate every remote-tracking ref whose branch
+        # portion matches the current branch; the configured upstream (@{u})
+        # names the canonical one when present. Zero refs => no remote
+        # evidence (not pushed). Several refs with DIFFERENT SHAs => the
+        # remote truth is ambiguous (pushed unknown, never True).
+        upstream = ""
+        remote: Optional[str] = None
+        remote_head: Optional[str] = None
+        upstream_r = _run(
+            "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"
+        )
+        if upstream_r.returncode == 0:
+            upstream = upstream_r.stdout.strip()
+            if upstream:
+                remote = upstream.split("/", 1)[0] or None
+
+        targets: list[tuple[str, str]] = []  # (remote name, sha)
+        refs_r = _run(
+            "for-each-ref", "--format=%(refname) %(objectname)",
+            "refs/remotes",
+        )
+        if refs_r.returncode == 0:
+            for line in refs_r.stdout.splitlines():
+                ref, _, sha = line.partition(" ")
+                if not (ref and sha):
+                    continue
+                rel = ref.replace("refs/remotes/", "", 1)
+                rname, _, rbranch = rel.partition("/")
+                if rbranch == branch:
+                    targets.append((rname, sha))
+        if upstream:
+            # The upstream ref must participate even when for-each-ref has
+            # not listed it yet (rev-parse @{u} resolved it).
+            rh_r = _run("rev-parse", "@{u}")
+            if rh_r.returncode == 0:
+                upstream_sha = rh_r.stdout.strip() or ""
+                if upstream_sha and not any(
+                    sha == upstream_sha for _, sha in targets
+                ):
+                    targets.append((remote or "origin", upstream_sha))
+
+        if targets:
+            distinct_shas = {sha for _, sha in targets}
+            if len(distinct_shas) == 1:
+                # Every remote agrees on the branch tip.
+                remote_head = next(iter(distinct_shas))
+                if not remote:
+                    remote = targets[0][0]
+            # len(distinct_shas) > 1: remotes disagree -> ambiguous, so
+            # remote_head stays None and pushed stays False/unknown.
+
+        ahead = behind = 0
+        if remote_head:
+            ab_r = _run(
+                "rev-list", "--left-right", "--count", f"HEAD...{remote_head}"
+            )
+            if ab_r.returncode == 0:
+                left, _, right = ab_r.stdout.strip().partition("\t")
+                try:
+                    ahead = int(left or 0)
+                except ValueError:
+                    ahead = 0
+                try:
+                    behind = int(right or 0)
+                except ValueError:
+                    behind = 0
+
+        # Pushed is a strict SHA equality against a real, unambiguous remote
+        # ref. Missing remote, probe error, or ambiguous remote evidence =>
+        # False / unknown, never True.
+        pushed = bool(remote_head) and remote_head == head
+        if remote_head:
+            unpushed = max(ahead, 0)
+        else:
+            # No comparable remote ref: count local commits absent from every
+            # remote ref (legacy semantic); pushed stays False.
+            count_r = _run("rev-list", "--count", "HEAD", "--not", "--remotes")
+            unpushed = 0
+            if count_r.returncode == 0:
+                try:
+                    unpushed = int(count_r.stdout.strip() or 0)
+                except ValueError:
+                    unpushed = 0
+
+        last_commit_r = _run("log", "-1", "--format=%ct")
         try:
-            ahead_n = int(ahead) if ahead else 0
-        except ValueError:
-            ahead_n = 0
-        try:
-            last_commit_at = int(last_commit) if last_commit else None
+            last_commit_at = int(last_commit_r.stdout.strip()) if last_commit_r.returncode == 0 and last_commit_r.stdout.strip() else None
         except ValueError:
             last_commit_at = None
         return {
-            "branch": branch or None,
+            "branch": branch,
             "head": head or None,
             "dirty": bool(dirty),
-            "committed": bool(head),
-            "pushed": ahead_n == 0 and bool(head),
-            "unpushed_commits": ahead_n,
+            "committed": committed,
+            "upstream": upstream or None,
+            "remote": remote,
+            "remote_head": remote_head,
+            "ahead": ahead,
+            "behind": behind,
+            "pushed": pushed,
+            "unpushed_commits": unpushed,
             "last_commit_at": last_commit_at,
         }
     except Exception:
@@ -5487,6 +5598,93 @@ def _last_handoff_next_action_type(conn: sqlite3.Connection, task_id: str) -> Op
     return None
 
 
+def _last_handoff_payload(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Full payload of the most recent terminal handoff event (parsed)."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, HANDOFF_EVENT_KIND),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _execution_witness_for(
+    conn: sqlite3.Connection, execution: Optional[dict],
+) -> Optional[dict]:
+    """Validate + normalise a persisted execution witness/materialization.
+
+    An AUTO continuation may only be persisted as STARTING when the caller
+    points at a REAL materialization record — a ``task_runs`` row created by
+    an executor that actually claimed/started the work. Accepts
+    ``{"source": "task_run", "run_id": <int>}`` and returns the normalized
+    record (source, run_id, task_id, status, outcome, started_at, ended_at)
+    only when the run row exists. Missing/unknown/invalid input returns None
+    so the caller must fail closed — AUTO is never persisted on the
+    resolver's word alone.
+    """
+    if not isinstance(execution, dict):
+        return None
+    if str(execution.get("source") or "").lower() not in ("task_run", "run"):
+        return None
+    rid = execution.get("run_id")
+    if not isinstance(rid, int) and not (
+        isinstance(rid, str) and rid.strip().isdigit()
+    ):
+        return None
+    try:
+        run_id = int(rid)
+    except (TypeError, ValueError):
+        return None
+    row = conn.execute(
+        "SELECT id, task_id, status, outcome, started_at, ended_at, "
+        "claim_expires, last_heartbeat_at "
+        "FROM task_runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "source": "task_run",
+        "run_id": int(row["id"]),
+        "task_id": row["task_id"],
+        "status": row["status"],
+        "outcome": row["outcome"],
+        "started_at": row["started_at"],
+        "ended_at": row["ended_at"],
+        "claim_expires": row["claim_expires"],
+        "last_heartbeat_at": row["last_heartbeat_at"],
+    }
+
+
+def _is_live_execution_witness(witness: Optional[dict], now: Optional[int] = None) -> bool:
+    """A witness is LIVE when its executor run is still in flight.
+
+    A run row that exists and is ``running`` with an unexpired claim counts
+    as a live heartbeat of the materialized action. Ended/crashed/failed runs
+    or expired claims are not live — the handoff watchdog must correct those
+    STARTING claims.
+    """
+    if not witness:
+        return False
+    if witness.get("source") != "task_run":
+        return False
+    if witness.get("status") != "running":
+        return False
+    if witness.get("ended_at") is not None:
+        return False
+    now_ts = int(time.time()) if now is None else int(now)
+    expires = witness.get("claim_expires")
+    if expires is not None and int(expires) <= now_ts:
+        return False
+    return True
+
+
 
 def emit_terminal_handoff(
     conn: sqlite3.Connection,
@@ -5495,6 +5693,7 @@ def emit_terminal_handoff(
     *,
     recompute: bool = False,
     autonomy_policy: Optional[dict] = None,
+    execution_witness: Optional[dict] = None,
 ) -> bool:
     """Emit the terminal handoff for a completed gate card, exactly once.
 
@@ -5507,10 +5706,16 @@ def emit_terminal_handoff(
     rationale, and action status — so Mission Control can render the
     decision and a restarted orchestrator never needs to re-derive it.
 
-    When the decision class is AUTO, a deduplicated ``auto_continue`` event
-    is recorded on the same card as the persisted continuation intent: a
-    restart / replay that re-scans the board sees the existing handoff and
-    emits nothing new, so an auto-launched workflow is never duplicated.
+    Execution-witness rule: an AUTO decision is persisted as AUTO/STARTING
+    ONLY when ``execution_witness`` references a REAL materialization record
+    — an existing ``task_runs`` row created by an executor that actually
+    claimed/started the work (see :func:`_execution_witness_for`). Without a
+    witness the handoff FAILS CLOSED to APPROVAL_REQUIRED + AWAITING_APPROVAL
+    and records no ``auto_continue`` event: the resolver's AUTO verdict or a
+    would-be auto_continue event is never, by itself, persisted as executed
+    intent. The gateway/CLI dispatch paths carry no executor, so their AUTO
+    decisions stop for the operator; a caller that has genuinely materialized
+    the action (an executor run) passes the witness and keeps STARTING.
 
     ``recompute=True`` re-derives the snapshot from current persisted state
     and, when the freshly derived verdict differs from the verdict stored by
@@ -5539,8 +5744,12 @@ def emit_terminal_handoff(
             probe_snapshot, autonomy_policy=autonomy_policy,
         )
         stored_type = _last_handoff_next_action_type(conn, target_id)
+        stored_payload = _last_handoff_payload(conn, target_id) or {}
+        stored_repo = stored_payload.get("repo_state") or {}
         if derived is None or (
-            stored == derived and stored_type == probe_next.get("type")
+            stored == derived
+            and stored_type == probe_next.get("type")
+            and stored_repo == probe_snapshot.get("repo_state")
         ):
             return False
     elif not recompute and has_marker:
@@ -5553,6 +5762,16 @@ def emit_terminal_handoff(
         True: "ACCEPTED", False: "REJECTED / CHANGES REQUIRED", None: "NO EXPLICIT VERDICT",
     }.get(snapshot["verdict"], "NO EXPLICIT VERDICT")
     decision_class = next_action.get("decisionClass") or APPROVAL_REQUIRED
+    fail_closed = False
+    witness: Optional[dict] = None
+    if decision_class == AUTO:
+        witness = _execution_witness_for(conn, execution_witness)
+        if witness is None:
+            # Never persist AUTO/STARTING merely because the resolver said
+            # AUTO: without a real persisted execution witness/materialization
+            # record the handoff fails closed to operator approval.
+            fail_closed = True
+            decision_class = APPROVAL_REQUIRED
     running_evidence = snapshot.get("running_evidence") or []
     owner_action = "REQUIRED" if decision_class == APPROVAL_REQUIRED else "NONE"
     action_status = (
@@ -5587,9 +5806,22 @@ def emit_terminal_handoff(
     )
     approval_txt = (
         "\nApproval required: YES — this action crosses the approval boundary."
-        if next_action.get("requiresApproval")
+        if next_action.get("requiresApproval") or fail_closed
         else "\nApproval required: no (low-risk, in-scope action)."
     )
+    execution_txt = ""
+    if witness:
+        execution_txt = (
+            f"\nExecution witness: run {witness['run_id']} on task "
+            f"{witness['task_id']} ({witness['status']}) — real persisted "
+            "materialization record."
+        )
+    elif fail_closed:
+        execution_txt = (
+            "\nAuto-continuation not persisted: no execution "
+            "witness/materialization record for the AUTO decision — failed "
+            "closed to operator approval."
+        )
     seq_txt = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(next_action.get("sequence", [])))
     running_txt = "\n".join(
         "  worker={workerPid} run={runId} lastHeartbeat={lastHeartbeat} "
@@ -5615,6 +5847,21 @@ def emit_terminal_handoff(
             f"Next step: {next_action.get('type', 'NONE')} — planned; "
             "execution not yet observed."
         )
+    delivery_wait_txt = ""
+    if (
+        decision_class == APPROVAL_REQUIRED
+        and next_action.get("type") == "DELIVERY_CHECKPOINT"
+        and snapshot["verdict"] is True
+        and bool((snapshot["repo_state"] or {}).get("dirty"))
+    ):
+        delivery_wait_txt = (
+            "\nLIVRAISON EN ATTENTE — gate accepted; changes remain uncommitted; "
+            "no remote update was performed. Commit/push require explicit owner "
+            "authorization; this handoff performed no Git mutation.\n"
+            "RECOMMENDED OWNER DECISION: APPROVE DELIVERY CHECKPOINT\n"
+            "Ready prompt (owner): approve the delivery checkpoint to stage, "
+            "commit, and push the accepted candidate."
+        )
     common_body = (
         f"{marker_line}\n"
         f"Mission: {snapshot['mission']}\n"
@@ -5626,7 +5873,9 @@ def emit_terminal_handoff(
         f"{next_action.get('reason', '')}\n"
         f"Decision class: {decision_txt}\n"
         f"Rationale: {next_action.get('rationale', '')}{approval_txt}\n"
+        f"Action status: {action_status}{execution_txt}\n"
         f"Sequence:\n{seq_txt}\n"
+        f"{closing_txt}{delivery_wait_txt}"
     )
     if decision_class == AUTO:
         if action_status == ACTION_STATUS_RUNNING:
@@ -5694,7 +5943,9 @@ def emit_terminal_handoff(
                 "decision": {
                     "actionType": next_action.get("type"),
                     "decisionClass": decision_class,
-                    "requiresApproval": bool(next_action.get("requiresApproval")),
+                    "requiresApproval": bool(
+                        next_action.get("requiresApproval") or fail_closed
+                    ),
                     "rationale": next_action.get("rationale"),
                     "actionStatus": action_status,
                     "ownerAction": owner_action,
@@ -5706,8 +5957,10 @@ def emit_terminal_handoff(
                     "why": next_action.get("rationale"),
                     "runningEvidence": running_evidence,
                     "analysis": analysis,
+                    "failClosedToApproval": fail_closed,
                     "autonomyMode": (autonomy_policy or DEFAULT_AUTONOMY_POLICY).get("mode"),
                 },
+                "execution": witness,
                 "autoContinue": decision_class == AUTO,
                 "recomputed": bool(recompute and has_marker),
                 "healthClassification": (
@@ -5728,6 +5981,10 @@ def emit_terminal_handoff(
                     "actionType": next_action.get("type"),
                     "decisionClass": AUTO,
                     "actionStatus": action_status,
+                    "execution": (
+                        {"source": witness["source"], "run_id": witness["run_id"]}
+                        if witness else None
+                    ),
                 },
             )
     return True
@@ -5761,6 +6018,111 @@ def emit_terminal_handoffs_if_due(
             # A failing handoff must never break the dispatcher tick.
             continue
     return emitted
+
+
+def watchdog_terminal_handoffs(conn: sqlite3.Connection, *, board=None) -> list[str]:
+    """Correct persisted STARTING auto-continuations that never gained a
+    live execution run/witness/heartbeat.
+
+    Bounded: scans only the NEWEST ``terminal_handoff`` event per card whose
+    ``decision.actionStatus`` is STARTING. For each, the recorded execution
+    witness (if any) must point at a ``task_runs`` row that is still running
+    with an unexpired claim; a run that completed is real materialization
+    (not the watchdog's job). Anything else — missing witness, missing run,
+    crashed/failed/ended run, expired claim — is a stuck claim: the watchdog
+    appends a corrective comment + ``terminal_handoff_watchdog`` event
+    flipping the persisted decision to APPROVAL_REQUIRED / AWAITING_APPROVAL.
+
+    Idempotent: exactly one correction per handoff event (keyed by the
+    ``handoff_event_id`` in the watchdog payload), so repeated dispatch ticks
+    never stack corrections. Safe to call on every dispatch tick; returns the
+    corrected task ids.
+    """
+    corrected: list[str] = []
+    rows = conn.execute(
+        "SELECT task_id, MAX(id) AS eid FROM task_events "
+        "WHERE kind = ? GROUP BY task_id",
+        (HANDOFF_EVENT_KIND,),
+    ).fetchall()
+    for row in rows:
+        task_id = row["task_id"]
+        ev = conn.execute(
+            "SELECT id, payload FROM task_events WHERE id = ?",
+            (int(row["eid"]),),
+        ).fetchone()
+        if not ev or not ev["payload"]:
+            continue
+        try:
+            payload = json.loads(ev["payload"])
+        except Exception:
+            continue
+        payload = payload or {}
+        decision = payload.get("decision") or {}
+        if decision.get("actionStatus") != ACTION_STATUS_STARTING:
+            continue
+        witness = _execution_witness_for(conn, payload.get("execution"))
+        if witness and witness.get("outcome") == "completed":
+            # A real executor completed the action; the stale STARTING label
+            # is the executor's to update, not a stuck-claim correction.
+            continue
+        if _is_live_execution_witness(witness):
+            continue
+        handoff_event_id = int(ev["id"])
+        already_corrected = False
+        for we in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+            (task_id, TERMINAL_WATCHDOG_EVENT_KIND),
+        ).fetchall():
+            if not we["payload"]:
+                continue
+            try:
+                wp = json.loads(we["payload"])
+            except Exception:
+                continue
+            if (wp or {}).get("handoff_event_id") == handoff_event_id:
+                already_corrected = True
+                break
+        if already_corrected:
+            continue
+        action_type = (
+            decision.get("actionType") or decision.get("type") or "AUTO_ACTION"
+        )
+        gate_id = payload.get("gate_id")
+        run_label = f"run {witness['run_id']}" if witness else "no run"
+        reason = (
+            "Auto action never gained a live execution run/witness/heartbeat "
+            f"(gate {gate_id or '?'}, {run_label}); corrective evidence "
+            "recorded — approval required."
+        )
+        comment_body = (
+            f"{HANDOFF_MARKER} (WATCHDOG — STARTING auto action without live "
+            "execution run/witness/heartbeat)\n"
+            f"Corrected {action_type} {ACTION_STATUS_STARTING} -> "
+            f"{APPROVAL_REQUIRED} / {ACTION_STATUS_AWAITING_APPROVAL}. "
+            f"{reason}"
+        )
+        with write_txn(conn):
+            add_comment(conn, task_id, HANDOFF_AUTHOR, comment_body)
+            _append_event(
+                conn, task_id, TERMINAL_WATCHDOG_EVENT_KIND,
+                {
+                    "gate_id": gate_id,
+                    "handoff_event_id": handoff_event_id,
+                    "from": {
+                        "actionType": action_type,
+                        "decisionClass": AUTO,
+                        "actionStatus": ACTION_STATUS_STARTING,
+                    },
+                    "to": {
+                        "decisionClass": APPROVAL_REQUIRED,
+                        "actionStatus": ACTION_STATUS_AWAITING_APPROVAL,
+                    },
+                    "reason": reason,
+                    "autoContinue": False,
+                },
+            )
+        corrected.append(task_id)
+    return corrected
 
 
 # ---------------------------------------------------------------------------
@@ -5800,6 +6162,13 @@ ACTION_STATUS_COMPLETED = "COMPLETED"
 ACTION_STATUS_FAILED = "FAILED"
 
 AUTO_CONTINUE_EVENT_KIND = "auto_continue"
+# Persisted execution-witness event kind: written by an executor when it
+# materializes an auto action, so AUTO/STARTING claims always point at a real
+# record instead of at the resolver's word alone.
+EXECUTION_WITNESS_EVENT_KIND = "execution_witness"
+# Corrective event kind written by the terminal-handoff watchdog when a
+# STARTING handoff never gained a live execution run/witness/heartbeat.
+TERMINAL_WATCHDOG_EVENT_KIND = "terminal_handoff_watchdog"
 RECOVERY_EVENT_KIND = "auto_recovery"
 
 AUTONOMY_MODE_AUTO = "auto"
@@ -5892,6 +6261,52 @@ def _branch_is_canonical(branch: Optional[str], policy: dict) -> bool:
     return branch.strip() in protected
 
 
+def _legacy_group_keys_for(action_type: str) -> tuple[str, ...]:
+    """Legacy approval verb keys whose identity group includes ``action_type``.
+
+    The legacy ``approvals_policy`` shape gated the verbs commit/push/merge,
+    which the resolver expanded onto workflow identities (see
+    ``_LEGACY_VERB_ALIASES``). A repo policy written with those natural verb
+    keys must keep gating those identities today — e.g. ``commit: required``
+    still makes ``DELIVERY_CHECKPOINT`` require approval.
+    """
+    return tuple(
+        verb for verb, aliases in _LEGACY_VERB_ALIASES.items()
+        if action_type in aliases
+    )
+
+
+def _resolve_approval_override(
+    action_type: Optional[str], approvals: Optional[dict],
+) -> Optional[str]:
+    """Resolve the explicit per-action approval override, case-insensitively.
+
+    An override keyed by the exact identity wins; otherwise the legacy verb
+    groups (commit/push/merge) that include the identity are consulted.
+    ``required`` from any contributing group wins; ``auto`` applies only when
+    every contributing group agrees — mirroring the legacy alias merge in
+    :func:`resolve_next_action`.
+    """
+    if not approvals or not action_type:
+        return None
+    upper: dict[str, str] = {}
+    for key, value in approvals.items():
+        if value in ("required", "auto"):
+            upper[str(key).strip().upper()] = value
+    direct = upper.get(action_type)
+    if direct:
+        return direct
+    values = [
+        v for v in (
+            upper.get(group) for group in _legacy_group_keys_for(action_type)
+        )
+        if v
+    ]
+    if not values:
+        return None
+    return "required" if "required" in values else "auto"
+
+
 def autonomy_policy_from_config(config: Optional[dict]) -> dict:
     """Normalise the persisted operator autonomy policy (config.yaml).
 
@@ -5959,8 +6374,12 @@ def classify_next_action(
     policy = dict(DEFAULT_AUTONOMY_POLICY, **(policy or {}))
     key = str(action_type or "").strip().upper() or None
 
-    # 1) Explicit operator override — highest precedence.
-    override = (policy.get("approvals") or {}).get(key) if key else None
+    # 1) Explicit operator override — highest precedence. An override keyed
+    # by the exact identity wins; legacy verb keys (commit/push/merge) gate
+    # the identities they alias, so a repository policy forbidding commit or
+    # push without owner approval stops even a feature-branch delivery
+    # checkpoint (repository policy wins over branch-context autonomy).
+    override = _resolve_approval_override(key, policy.get("approvals") or {})
     if override == "required":
         return {
             "decisionClass": APPROVAL_REQUIRED,

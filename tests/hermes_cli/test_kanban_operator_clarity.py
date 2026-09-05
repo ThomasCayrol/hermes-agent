@@ -80,20 +80,20 @@ def test_a_live_worker_with_fresh_heartbeat_is_running_and_needs_no_owner_action
     assert state["runningEvidence"]["currentTask"] == task_id
 
 
-def test_b_auto_next_action_without_execution_is_starting_not_running(conn):
+def test_b_auto_next_action_without_execution_fails_closed_to_approval(conn):
     umbrella, gate = _completed_gate(conn, result="REJECTED")
 
     assert kb.emit_terminal_handoffs_if_due(conn) == [gate]
 
     comment = kb.list_comments(conn, umbrella)[-1].body
     payload = _last_payload(conn, umbrella, kb.HANDOFF_EVENT_KIND)
-    assert "OWNER ACTION: NONE" in comment
-    assert "ACTION STATUS: STARTING" in comment
-    assert "ACTION STATUS: RUNNING" not in comment
-    assert "Récupération automatique en cours" not in comment
-    assert "progressing automatically" not in comment.lower()
-    assert payload["decision"]["ownerAction"] == "NONE"
-    assert payload["decision"]["actionStatus"] == kb.ACTION_STATUS_STARTING
+    assert "OWNER ACTION: REQUIRED" in comment
+    assert "ACTION STATUS: AWAITING_APPROVAL" in comment
+    assert "ACTION AUTO PLANIFIÉE" not in comment
+    assert "Auto-continuation not persisted" in comment
+    assert payload["decision"]["ownerAction"] == "REQUIRED"
+    assert payload["decision"]["actionStatus"] == kb.ACTION_STATUS_AWAITING_APPROVAL
+    assert payload["decision"]["failClosedToApproval"] is True
 
 
 def test_c_approval_immediately_exposes_required_action_and_why(conn):
@@ -165,7 +165,7 @@ def test_e_completed_gate_awaiting_merge_requires_owner_approval(
     assert "ACTION STATUS: AWAITING_APPROVAL" in comment
 
 
-def test_f_legitimate_long_running_handoff_has_concise_running_evidence(conn):
+def test_f_long_running_handoff_without_execution_witness_fails_closed(conn):
     umbrella, gate = _completed_gate(conn, result="REJECTED")
     worker = kb.create_task(
         conn,
@@ -190,11 +190,7 @@ def test_f_legitimate_long_running_handoff_has_concise_running_evidence(conn):
     assert kb.emit_terminal_handoffs_if_due(conn) == [gate]
 
     comment = kb.list_comments(conn, umbrella)[-1].body
-    assert "OWNER ACTION: NONE" in comment
-    assert "ACTION STATUS: RUNNING" in comment
-    assert "RUNNING EVIDENCE" in comment
-    assert f"worker={os.getpid()}" in comment
-    assert f"run={claimed.current_run_id}" in comment
-    assert f"lastHeartbeat={now}" in comment
-    assert f"lastActivity={now}" in comment
-    assert f"currentTask={worker}" in comment
+    assert "OWNER ACTION: REQUIRED" in comment
+    assert "ACTION STATUS: AWAITING_APPROVAL" in comment
+    assert "RUNNING EVIDENCE" not in comment
+    assert "Auto-continuation not persisted" in comment

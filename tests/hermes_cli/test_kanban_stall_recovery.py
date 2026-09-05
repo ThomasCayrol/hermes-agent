@@ -370,16 +370,15 @@ def test_g_approval_handoff_emits_exact_french_operator_headings(conn):
     assert "ACTION STATUS: AWAITING_APPROVAL" in comment
 
 
-def test_h_auto_handoff_is_starting_without_claiming_progress(conn):
+def test_h_auto_handoff_without_execution_witness_fails_closed(conn):
     umbrella, gate = _completed_gate(conn, result="REJECTED")
     assert kb.emit_terminal_handoffs_if_due(conn) == [gate]
     comment = kb.list_comments(conn, umbrella)[-1].body
-    assert "ACTION AUTO PLANIFIÉE" in comment
-    assert "OWNER ACTION: NONE" in comment
-    assert "ACTION STATUS: STARTING" in comment
-    assert "Récupération automatique en cours" not in comment
-    assert "aucune action opérateur requise" in comment
-    assert "READY-TO-SEND PROMPT" not in comment
+    assert "MISSION ARRÊTÉE" in comment
+    assert "OWNER ACTION: REQUIRED" in comment
+    assert "ACTION STATUS: AWAITING_APPROVAL" in comment
+    assert "Auto-continuation not persisted" in comment
+    assert "READY-TO-SEND PROMPT" in comment
 
 
 def test_i_historical_reject_prose_does_not_override_structured_accept(conn):
