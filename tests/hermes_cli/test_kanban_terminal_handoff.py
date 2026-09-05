@@ -155,7 +155,7 @@ def test_repo_state_reflects_git_dirty(kanban_home, conn, tmp_path):
     )
     state = kb.repo_state_for(kb.get_task(conn, gate))
     assert state.get("dirty") is True
-    assert state.get("committed") is True
+    assert state.get("committed") is False
     assert state.get("branch")
 
 

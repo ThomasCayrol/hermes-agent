@@ -4902,7 +4902,6 @@ def repo_state_for(task: Optional[Task]) -> dict:
 
         head_r = _run("rev-parse", "HEAD")
         head = head_r.stdout.strip() if head_r.returncode == 0 else ""
-        committed = bool(head)
 
         branch_raw = ""
         branch_r = _run("rev-parse", "--abbrev-ref", "HEAD")
@@ -4912,6 +4911,9 @@ def repo_state_for(task: Optional[Task]) -> dict:
         branch = None if not branch_raw or branch_raw == "HEAD" else branch_raw
 
         dirty = bool(_run("status", "--porcelain").stdout.strip())
+        # A dirty workspace has no committed delivery state: HEAD may exist,
+        # but the candidate represented by this workspace is not committed.
+        committed = bool(head) and not dirty
 
         # Remote truth. Enumerate every remote-tracking ref whose branch
         # portion matches the current branch; the configured upstream (@{u})

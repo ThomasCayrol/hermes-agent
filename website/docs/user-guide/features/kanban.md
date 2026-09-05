@@ -596,7 +596,8 @@ handoff, it:
    `task.result`, then only the opening verdict line of the run summary),
    active workers, unresolved blockers, and the **git truth** of the gate's
    `dir` workspace — probed with real `git` commands: full HEAD SHA, branch,
-   dirty (tracked + staged + untracked), committed, upstream/remote,
+   dirty (tracked + staged + untracked), committed (HEAD exists and the
+   workspace is clean), upstream/remote,
    ahead/behind, remote SHA. `pushed` is true **only** when a remote ref
    exists whose SHA equals the local HEAD SHA; a missing, stale, or
    ambiguous remote (several remotes disagree) is never reported as pushed.
