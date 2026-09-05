@@ -787,3 +787,58 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+def test_external_ci_wait_delivers_operator_alert(tmp_path, monkeypatch):
+    """An `external_ci_wait` event (CI watchdog) reaches the subscriber as a
+    passive alert. The CI_* state stays internal to the payload — the copy
+    carries the external-dependency status, never a worker-stall label."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "ci-wait-notify.db"))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="deliver PR #6", assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            chat_type="dm", delivery_mode="notify",
+        )
+        kb._append_event(
+            conn, tid, "external_ci_wait",
+            {
+                "ciState": "CI_INFRA_STALLED",
+                "externalDependencyStatus": "CI_INFRA_STALLED",
+                "summary": (
+                    "GitHub Actions attend un runner depuis 1h12. Aucun test "
+                    "n'a encore démarré. Aucun échec de code n'est observé."
+                ),
+                "attention": "ACTION_REQUIRED",
+                "ownerAction": "REQUIRED",
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, "external_ci_wait must produce a notification"
+    text = adapter.sent[0]["text"]
+    assert tid in text
+    assert "CI externe" in text
+    assert "CI_INFRA_STALLED" in text
+    assert "Aucun test n'a encore démarré" in text
+    # Cursor advanced: the event is claimed and not re-delivered.
+    conn = kb.connect()
+    try:
+        _, remaining = kb.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kinds=["external_ci_wait"],
+        )
+    finally:
+        conn.close()
+    assert remaining == []
