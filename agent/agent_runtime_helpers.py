@@ -2934,6 +2934,15 @@ def switch_model(
     old_model = agent.model
     old_provider = agent.provider
 
+    # Capture the primary runtime identity BEFORE this switch mutates it.
+    # switch_model re-snapshots ``_primary_runtime`` to the destination
+    # later in this function, so the return-to-primary carve-out for
+    # fallback pruning must compare against the primary that was in force
+    # when the switch started — not the destination it is about to become.
+    _primary_before_switch = str(
+        (getattr(agent, "_primary_runtime", None) or {}).get("provider") or ""
+    ).strip().lower()
+
     # ── Determine api_mode if not provided ──
     # Pass model so dual-wire providers (Nous Portal anthropic/* → Messages)
     # resolve correctly; without it determine_api_mode falls back to the
@@ -3388,10 +3397,23 @@ def switch_model(
     # primary silently re-activates the provider the user just rejected,
     # which is exactly what was reported during TUI v2 blitz testing
     # ("switched to anthropic, tui keeps trying openrouter").
+    #
+    # Exception: switching BACK to the provider that was the primary when
+    # the switch started (a return to the primary, e.g. a session re-pin
+    # after an automatic fallback or a one-turn model override) is not a
+    # rejection of the provider being left — that provider is the
+    # configured fallback and must remain available for the next
+    # rate-limit failover.  Without this carve-out, the re-pin pruned the
+    # fallback entry (it matched the provider switched away from) and the
+    # next HTTP 429 on the restored primary surfaced as a terminal
+    # provider error with no fallback attempted.
     old_norm = (old_provider or "").strip().lower()
     new_norm = (new_provider or "").strip().lower()
+    returning_to_primary = bool(_primary_before_switch) and bool(new_norm) and (
+        new_norm == _primary_before_switch and old_norm != _primary_before_switch
+    )
     fallback_chain = list(getattr(agent, "_fallback_chain", []) or [])
-    if old_norm and new_norm and old_norm != new_norm:
+    if old_norm and new_norm and old_norm != new_norm and not returning_to_primary:
         fallback_chain = [
             entry for entry in fallback_chain
             if (entry.get("provider") or "").strip().lower() not in {old_norm, new_norm}
