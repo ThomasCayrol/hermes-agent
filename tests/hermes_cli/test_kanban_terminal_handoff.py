@@ -692,25 +692,46 @@ def test_recompute_type_refresh_keeps_verdict_when_type_unchanged(conn, tmp_path
 # and performs no mutation.
 
 
-def _executor_witness(conn):
-    """Claim a real executor card -> execution witness.
+def _executor_witness(conn, mission_task_id, *, action_type="REMEDIATION"):
+    """Claim a same-mission executor and persist its action relation.
 
     Returns ``{"source": "task_run", "run_id": ...}`` referencing the live
     task_runs row the executor's claim created — a real persisted
-    materialization record, never an invented one. The card is deliberately
-    NOT linked under the mission umbrella so the in-flight executor does not
-    show up as an active mission worker.
+    materialization record, never an invented one. Both the task link and the
+    execution_witness event bind the run to the target mission/action.
     """
     child = kb.create_task(
-        conn, title="Auto executor", assignee="tester",
+        conn,
+        title="Auto executor",
+        assignee="tester",
+        parents=[mission_task_id],
     )
+    parent = kb.get_task(conn, mission_task_id)
+    if parent is not None and parent.status != "done":
+        kb.claim_task(conn, mission_task_id)
+        kb.complete_task(conn, mission_task_id, result="mission underway")
     claimed = kb.claim_task(conn, child, claimer="test")
     if claimed is None:
         ok, why = kb.promote_task(conn, child, actor="test")
         assert ok, why
         claimed = kb.claim_task(conn, child, claimer="test")
     assert claimed is not None and claimed.current_run_id is not None
-    return {"source": "task_run", "run_id": int(claimed.current_run_id)}
+    run_id = int(claimed.current_run_id)
+    with kb.write_txn(conn):
+        kb._append_event(
+            conn,
+            child,
+            kb.EXECUTION_WITNESS_EVENT_KIND,
+            {
+                "source": "task_run",
+                "run_id": run_id,
+                "task_id": child,
+                "mission_task_id": mission_task_id,
+                "actionType": action_type,
+            },
+            run_id=run_id,
+        )
+    return {"source": "task_run", "run_id": run_id}
 
 
 def test_auto_without_execution_witness_fails_closed_to_approval(conn):
@@ -756,7 +777,7 @@ def test_auto_with_execution_witness_persists_starting_and_continue(conn):
         verdict_result="REJECT",
         verdict_summary="QA rejected: changes required.",
     )
-    witness = _executor_witness(conn)
+    witness = _executor_witness(conn, umbrella)
     gate_task = kb.get_task(conn, gate)
     assert gate_task is not None
     assert kb.emit_terminal_handoff(
@@ -786,6 +807,38 @@ def test_auto_with_execution_witness_persists_starting_and_continue(conn):
     with kb.connect() as conn2:
         assert kb.emit_terminal_handoffs_if_due(conn2) == []
         assert len(_handoff_comment_bodies(conn2, umbrella)) == 1
+
+
+def test_cross_mission_execution_witness_fails_closed_without_auto_continue(conn):
+    """A live run related to another mission cannot authorize this mission's
+    AUTO/STARTING transition or be described as same-mission recovery."""
+    target_mission, target_gate = _run_mission(
+        conn,
+        verdict_result="REJECT",
+        verdict_summary="QA rejected: changes required.",
+    )
+    other_mission = kb.create_task(conn, title="Other mission", role="umbrella")
+    witness = _executor_witness(conn, other_mission)
+
+    gate_task = kb.get_task(conn, target_gate)
+    assert gate_task is not None
+    assert kb.emit_terminal_handoff(
+        conn, gate_task, execution_witness=witness,
+    ) is True
+
+    newest = _newest_handoff_event_payload(conn, target_mission)
+    assert newest["decision"]["decisionClass"] == kb.APPROVAL_REQUIRED
+    assert newest["decision"]["actionStatus"] == kb.ACTION_STATUS_AWAITING_APPROVAL
+    assert newest["decision"]["failClosedToApproval"] is True
+    assert newest["discussion"]["status"] == kb.DISCUSSION_OWNER_ACTION_REQUIRED
+    assert newest["discussion"]["reason"] != "auto_continuation_active"
+    assert newest["execution"] is None
+    assert newest["autoContinue"] is False
+    assert "de la même mission" not in _handoff_comment_bodies(conn, target_mission)[0]
+    assert conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+        (target_mission, kb.AUTO_CONTINUE_EVENT_KIND),
+    ).fetchone() is None
 
 
 def test_accepted_dirty_feature_branch_repo_policy_requires_approval(conn, tmp_path):
@@ -912,6 +965,16 @@ def test_watchdog_corrects_starting_without_witness_and_is_idempotent(conn):
     assert len(bodies) == 1
     assert "WATCHDOG" in bodies[0]
     assert "AWAITING_APPROVAL" in bodies[0]
+    headings = [
+        "## NEXT ACTION",
+        "## DISCUSSION STATUS",
+        "## DISCUSSION ACTION",
+        "## DECISION CLASS",
+        "## ACTION STATUS",
+    ]
+    assert [bodies[0].index(h) for h in headings] == sorted(
+        bodies[0].index(h) for h in headings
+    )
 
     events = _watchdog_events(conn, umbrella)
     assert len(events) == 1
@@ -919,6 +982,8 @@ def test_watchdog_corrects_starting_without_witness_and_is_idempotent(conn):
     assert payload["from"]["actionStatus"] == kb.ACTION_STATUS_STARTING
     assert payload["to"]["decisionClass"] == kb.APPROVAL_REQUIRED
     assert payload["to"]["actionStatus"] == kb.ACTION_STATUS_AWAITING_APPROVAL
+    assert payload["discussion"]["status"] == kb.DISCUSSION_OWNER_ACTION_REQUIRED
+    assert "Action du propriétaire requise" in payload["discussion"]["action"]
 
     # Idempotent: the same STARTING handoff is never corrected twice.
     assert kb.watchdog_terminal_handoffs(conn) == []
@@ -933,7 +998,7 @@ def test_watchdog_skips_starting_with_live_execution_witness(conn):
         verdict_result="REJECT",
         verdict_summary="QA rejected: changes required.",
     )
-    witness = _executor_witness(conn)
+    witness = _executor_witness(conn, umbrella)
     gate_task = kb.get_task(conn, gate)
     assert gate_task is not None
     assert kb.emit_terminal_handoff(
@@ -953,7 +1018,7 @@ def test_watchdog_corrects_starting_whose_executor_run_died(conn):
         verdict_result="REJECT",
         verdict_summary="QA rejected: changes required.",
     )
-    witness = _executor_witness(conn)
+    witness = _executor_witness(conn, umbrella)
     gate_task = kb.get_task(conn, gate)
     assert gate_task is not None
     assert kb.emit_terminal_handoff(
@@ -1106,3 +1171,442 @@ def test_recompute_historical_prose_cannot_override_structured_git_truth(conn, t
     # Stored fields now match Git truth -> no further corrective emissions.
     assert kb.emit_terminal_handoff(conn, gate_task, recompute=True) is False
     assert len(_handoff_comment_bodies(conn, umbrella)) == 2
+
+
+# -- discussion lifecycle projection (A-H) ---------------------------------
+
+
+def test_discussion_a_completed_without_follow_up_is_archive_ready():
+    discussion = kb.resolve_discussion_lifecycle(
+        {
+            "gate_id": "t_gate",
+            "gate_status": "done",
+            "active_workers": [],
+            "pending_work": [],
+            "blockers": [],
+        },
+        next_action={"type": "NONE", "requiresApproval": False},
+        decision_class=kb.AUTO,
+        action_status=kb.ACTION_STATUS_EXECUTED,
+    )
+
+    assert discussion["status"] == kb.DISCUSSION_ARCHIVE_READY
+    assert discussion["action"] == (
+        "Aucune action requise : mission terminée, aucun suivi actif détecté. "
+        "Archivage autorisé."
+    )
+
+
+def test_discussion_b_separate_future_increment_does_not_keep_mission_open(conn):
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    future = kb.create_task(conn, title="Independent future increment")
+    assert future not in {umbrella, gate}
+
+    snapshot = kb.synthesize_terminal_handoff(
+        conn,
+        kb.get_task(conn, gate),
+        kb.get_task(conn, umbrella),
+    )
+    discussion = kb.resolve_discussion_lifecycle(
+        snapshot,
+        next_action={"type": "NONE", "requiresApproval": False},
+        decision_class=kb.AUTO,
+        action_status=kb.ACTION_STATUS_EXECUTED,
+    )
+
+    assert snapshot["pending_work"] == []
+    assert discussion["status"] == kb.DISCUSSION_ARCHIVE_READY
+
+
+def test_discussion_c_nested_running_worker_keeps_mission_open(conn):
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    phase = kb.create_task(conn, title="Mission phase", parents=[umbrella])
+    assert kb.claim_task(conn, phase) is not None
+    assert kb.complete_task(conn, phase, result="phase complete")
+    worker = kb.create_task(
+        conn,
+        title="Nested active worker",
+        assignee="hotelos-lead",
+        parents=[phase],
+    )
+    assert kb.claim_task(conn, worker) is not None
+
+    snapshot = kb.synthesize_terminal_handoff(
+        conn,
+        kb.get_task(conn, gate),
+        kb.get_task(conn, umbrella),
+    )
+    discussion = kb.resolve_discussion_lifecycle(
+        snapshot,
+        next_action={"type": "AWAITING_WORKERS", "requiresApproval": False},
+        decision_class=kb.AUTO,
+        action_status=kb.ACTION_STATUS_STARTING,
+    )
+
+    assert any(item.startswith(worker) for item in snapshot["active_workers"])
+    assert discussion["status"] == kb.DISCUSSION_KEEP_OPEN
+    assert "ne pas archiver" in discussion["action"]
+
+
+def test_discussion_d_auto_recovery_with_live_witness_keeps_open():
+    discussion = kb.resolve_discussion_lifecycle(
+        {
+            "gate_id": "t_gate",
+            "gate_status": "done",
+            "active_workers": [],
+            "pending_work": [],
+            "blockers": [],
+            "state_conflicts": [],
+        },
+        next_action={"type": "REMEDIATION", "requiresApproval": False},
+        decision_class=kb.AUTO,
+        action_status=kb.ACTION_STATUS_STARTING,
+        execution_witness={
+            "source": "task_run",
+            "run_id": 42,
+            "task_id": "t_recovery",
+            "status": "running",
+        },
+        execution_is_live=True,
+    )
+
+    assert discussion["status"] == kb.DISCUSSION_KEEP_OPEN
+    assert discussion["reason"] == "auto_continuation_active"
+    assert "recovery AUTO" in discussion["action"]
+
+
+def test_discussion_d_auto_recovery_without_witness_fails_closed_to_owner():
+    discussion = kb.resolve_discussion_lifecycle(
+        {
+            "gate_id": "t_gate",
+            "gate_status": "done",
+            "active_workers": [],
+            "pending_work": [],
+            "blockers": [],
+            "state_conflicts": [],
+        },
+        next_action={"type": "REMEDIATION", "requiresApproval": False},
+        decision_class=kb.AUTO,
+        action_status=kb.ACTION_STATUS_STARTING,
+    )
+
+    assert discussion["status"] == kb.DISCUSSION_OWNER_ACTION_REQUIRED
+    assert discussion["reason"] == "auto_start_without_live_execution_witness"
+    assert "État non démontré" in discussion["action"]
+
+
+def test_discussion_e_delivery_approval_requires_owner_action():
+    discussion = kb.resolve_discussion_lifecycle(
+        {
+            "gate_id": "t_gate",
+            "gate_status": "done",
+            "active_workers": [],
+            "pending_work": [],
+            "blockers": [],
+            "state_conflicts": [],
+        },
+        next_action={"type": "DELIVERY_CHECKPOINT", "requiresApproval": True},
+        decision_class=kb.APPROVAL_REQUIRED,
+        action_status=kb.ACTION_STATUS_AWAITING_APPROVAL,
+    )
+
+    assert discussion["status"] == kb.DISCUSSION_OWNER_ACTION_REQUIRED
+    assert discussion["reason"] == "owner_approval_required"
+    assert "livraison" in discussion["action"]
+    assert "Aucune modification" in discussion["action"]
+
+
+def test_discussion_f_merge_approval_beats_auto_mode():
+    discussion = kb.resolve_discussion_lifecycle(
+        {
+            "gate_id": "t_gate",
+            "gate_status": "done",
+            "active_workers": ["t_worker (hotelos-lead)"],
+            "pending_work": [],
+            "blockers": [],
+            "state_conflicts": [],
+        },
+        next_action={"type": "INTEGRATION_REVIEW", "requiresApproval": True},
+        decision_class=kb.APPROVAL_REQUIRED,
+        action_status=kb.ACTION_STATUS_AWAITING_APPROVAL,
+    )
+
+    assert discussion["status"] == kb.DISCUSSION_OWNER_ACTION_REQUIRED
+    assert discussion["reason"] == "owner_approval_required"
+    assert "merge" in discussion["action"]
+    assert "Aucun merge" in discussion["action"]
+
+
+def test_discussion_g_same_mission_remediation_pending_keeps_open(conn):
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="REJECT",
+        verdict_summary="QA rejected: remediation required.",
+    )
+    remediation = kb.create_task(
+        conn,
+        title="Corrective remediation",
+        assignee="hotelos-lead",
+        parents=[umbrella],
+    )
+
+    snapshot = kb.synthesize_terminal_handoff(
+        conn,
+        kb.get_task(conn, gate),
+        kb.get_task(conn, umbrella),
+    )
+    discussion = kb.resolve_discussion_lifecycle(
+        snapshot,
+        next_action={"type": "REMEDIATION", "requiresApproval": False},
+        decision_class=kb.AUTO,
+        action_status=kb.ACTION_STATUS_EXECUTED,
+    )
+
+    assert any(item.startswith(remediation) for item in snapshot["pending_work"])
+    assert discussion["status"] == kb.DISCUSSION_KEEP_OPEN
+    assert discussion["reason"] == "same_mission_work_pending"
+    assert "remediation" in discussion["action"]
+
+
+def test_discussion_h_historical_terminal_prose_does_not_reopen_mission():
+    snapshot = {
+        "mission_task_id": "t_mission",
+        "gate_id": "t_gate",
+        "gate_status": "archived",
+        "active_workers": [],
+        "pending_work": [],
+        "blockers": [],
+        "state_conflicts": [],
+        "historical_comments": [
+            "A worker was running and remediation remained open last month."
+        ],
+    }
+    first = kb.resolve_discussion_lifecycle(
+        snapshot,
+        next_action={"type": "NONE", "requiresApproval": False},
+        decision_class=kb.AUTO,
+        action_status=kb.ACTION_STATUS_EXECUTED,
+    )
+    replay = kb.resolve_discussion_lifecycle(
+        snapshot,
+        next_action={"type": "NONE", "requiresApproval": False},
+        decision_class=kb.AUTO,
+        action_status=kb.ACTION_STATUS_EXECUTED,
+    )
+
+    assert first == replay
+    assert first["status"] == kb.DISCUSSION_ARCHIVE_READY
+    assert first["evidence"]["missionTaskId"] == "t_mission"
+    assert first["evidence"]["gateId"] == "t_gate"
+
+
+def test_terminal_handoff_renders_and_persists_additive_discussion_fields(conn):
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    gate_task = kb.get_task(conn, gate)
+    umbrella_task = kb.get_task(conn, umbrella)
+    assert gate_task is not None and umbrella_task is not None
+    snapshot = kb.synthesize_terminal_handoff(conn, gate_task, umbrella_task)
+    existing_decision = kb.resolve_next_action(snapshot)
+
+    assert kb.emit_terminal_handoff(conn, gate_task) is True
+
+    body = _handoff_comment_bodies(conn, umbrella)[0]
+    headings = [
+        "## NEXT ACTION",
+        "## DISCUSSION STATUS",
+        "## DISCUSSION ACTION",
+        "## DECISION CLASS",
+        "## ACTION STATUS",
+    ]
+    positions = [body.index(heading) for heading in headings]
+    assert positions == sorted(positions)
+    assert "Action du propriétaire requise" in body
+
+    payload = _newest_handoff_event_payload(conn, umbrella)
+    assert payload["next_action"]["type"] == existing_decision["type"]
+    assert payload["decision"]["decisionClass"] == existing_decision["decisionClass"]
+    assert payload["decision"]["actionStatus"] == kb.ACTION_STATUS_AWAITING_APPROVAL
+    assert payload["discussion"]["status"] == kb.DISCUSSION_OWNER_ACTION_REQUIRED
+    assert payload["discussion"]["action"]
+    assert payload["discussion"]["evidence"]["missionTaskId"] == umbrella
+
+    with kb.connect() as conn2:
+        assert kb.emit_terminal_handoffs_if_due(conn2) == []
+        assert len(_handoff_comment_bodies(conn2, umbrella)) == 1
+
+
+def test_discussion_conflicting_run_identity_fails_closed_to_owner():
+    discussion = kb.resolve_discussion_lifecycle(
+        {
+            "mission_task_id": "t_mission",
+            "gate_id": "t_gate",
+            "gate_status": "done",
+            "active_workers": [],
+            "pending_work": [],
+            "blockers": [],
+            "state_conflicts": [
+                "t_worker (running task without coherent live run)"
+            ],
+        },
+        next_action={"type": "NONE", "requiresApproval": False},
+        decision_class=kb.AUTO,
+        action_status=kb.ACTION_STATUS_EXECUTED,
+    )
+
+    assert discussion["status"] == kb.DISCUSSION_OWNER_ACTION_REQUIRED
+    assert discussion["reason"] == "insufficient_or_conflicting_evidence"
+    assert "vérification requise" in discussion["action"]
+
+
+def test_discussion_terminal_task_with_live_run_fails_closed(conn):
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    worker = kb.create_task(
+        conn,
+        title="Contradictory worker state",
+        assignee="hotelos-lead",
+        parents=[umbrella],
+    )
+    assert kb.claim_task(conn, worker) is not None
+    conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (worker,))
+
+    gate_task = kb.get_task(conn, gate)
+    umbrella_task = kb.get_task(conn, umbrella)
+    assert gate_task is not None and umbrella_task is not None
+    snapshot = kb.synthesize_terminal_handoff(conn, gate_task, umbrella_task)
+    discussion = kb.resolve_discussion_lifecycle(
+        snapshot,
+        next_action={"type": "NONE", "requiresApproval": False},
+        decision_class=kb.AUTO,
+        action_status=kb.ACTION_STATUS_EXECUTED,
+    )
+
+    assert any(item.startswith(worker) for item in snapshot["state_conflicts"])
+    assert discussion["status"] == kb.DISCUSSION_OWNER_ACTION_REQUIRED
+    assert discussion["reason"] == "insufficient_or_conflicting_evidence"
+
+
+@pytest.mark.parametrize(
+    "run_anomaly",
+    ["terminal_orphan", "terminal_non_current", "multiple_live"],
+)
+def test_discussion_all_descendant_live_run_anomalies_fail_closed(
+    conn, run_anomaly,
+):
+    """Every descendant run participates in reconciliation: orphan,
+    non-current, and multiple live runs are contradictory and can never
+    produce a false ARCHIVE_READY result."""
+    import time
+
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    worker = kb.create_task(
+        conn,
+        title="Worker with run anomaly",
+        assignee="hotelos-lead",
+        parents=[umbrella],
+    )
+    claimed = kb.claim_task(conn, worker)
+    assert claimed is not None and claimed.current_run_id is not None
+    current_run_id = int(claimed.current_run_id)
+    now = int(time.time())
+
+    if run_anomaly == "terminal_orphan":
+        conn.execute(
+            "UPDATE tasks SET status = 'done', current_run_id = NULL WHERE id = ?",
+            (worker,),
+        )
+    elif run_anomaly == "terminal_non_current":
+        conn.execute(
+            "UPDATE task_runs SET status = 'done', outcome = 'completed', "
+            "ended_at = ? WHERE id = ?",
+            (now, current_run_id),
+        )
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (worker,))
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_expires, "
+            "started_at) VALUES (?, ?, 'running', ?, ?)",
+            (worker, "hotelos-lead", now + 300, now),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_expires, "
+            "started_at) VALUES (?, ?, 'running', ?, ?)",
+            (worker, "hotelos-lead", now + 300, now),
+        )
+
+    gate_task = kb.get_task(conn, gate)
+    umbrella_task = kb.get_task(conn, umbrella)
+    assert gate_task is not None and umbrella_task is not None
+    snapshot = kb.synthesize_terminal_handoff(conn, gate_task, umbrella_task)
+    discussion = kb.resolve_discussion_lifecycle(
+        snapshot,
+        next_action={"type": "NONE", "requiresApproval": False},
+        decision_class=kb.AUTO,
+        action_status=kb.ACTION_STATUS_EXECUTED,
+    )
+
+    assert any(worker in conflict for conflict in snapshot["state_conflicts"])
+    assert discussion["status"] == kb.DISCUSSION_OWNER_ACTION_REQUIRED
+    assert discussion["status"] != kb.DISCUSSION_ARCHIVE_READY
+
+
+def test_discussion_no_false_archive_when_descendant_runs_cleanly_ended(conn):
+    """Terminal descendant with a coherent ended run is NOT a state conflict:
+    cleanly completed runs never block ARCHIVE_READY (no false archive)."""
+    import time
+
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    worker = kb.create_task(
+        conn,
+        title="Completed worker",
+        assignee="hotelos-lead",
+        parents=[umbrella],
+    )
+    claimed = kb.claim_task(conn, worker)
+    assert claimed is not None and claimed.current_run_id is not None
+    run_id = int(claimed.current_run_id)
+    assert kb.complete_task(conn, worker, result="done") is True
+    conn.execute(
+        "UPDATE task_runs SET status = 'done', outcome = 'completed', "
+        "ended_at = ? WHERE id = ?",
+        (int(time.time()), run_id),
+    )
+
+    gate_task = kb.get_task(conn, gate)
+    umbrella_task = kb.get_task(conn, umbrella)
+    assert gate_task is not None and umbrella_task is not None
+    snapshot = kb.synthesize_terminal_handoff(conn, gate_task, umbrella_task)
+    discussion = kb.resolve_discussion_lifecycle(
+        snapshot,
+        next_action={"type": "NONE", "requiresApproval": False},
+        decision_class=kb.AUTO,
+        action_status=kb.ACTION_STATUS_EXECUTED,
+    )
+
+    assert snapshot["state_conflicts"] == []
+    assert snapshot["active_workers"] == []
+    assert snapshot["pending_work"] == []
+    assert discussion["status"] == kb.DISCUSSION_ARCHIVE_READY
