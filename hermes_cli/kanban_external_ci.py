@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -264,6 +265,32 @@ _EVIDENCE_REQUIRED_KEYS = (
 )
 
 
+def _required_pair_map(required_checks: Any) -> Optional[dict]:
+    """Map each required job id to its single authoritative run id.
+
+    Built strictly from the GraphQL required-check rollup rows (each row
+    carries ``jobId`` + ``runId``). Returns None when the rollup is absent, a
+    row is malformed, or the same job id appears more than once (duplicate or
+    conflicting rows) — callers MUST fail closed on None, because a retry
+    target is only ever derived from an exact, unique (jobId, runId) pair.
+    """
+    if not isinstance(required_checks, list) or not required_checks:
+        return None
+    pairs: dict[str, str] = {}
+    for check in required_checks:
+        if not isinstance(check, dict):
+            return None
+        job_id = str(check.get("jobId") or "")
+        run_id = str(check.get("runId") or "")
+        if not job_id.isdigit() or not run_id.isdigit():
+            return None
+        if job_id in pairs:
+            # Duplicate/conflicting required row — same job bound twice.
+            return None
+        pairs[job_id] = run_id
+    return pairs
+
+
 @dataclass
 class EvidenceSnapshot:
     """A validated, timestamped GitHub evidence snapshot (no DB writes).
@@ -283,6 +310,14 @@ class EvidenceSnapshot:
     # True when the observed workflow/check is still REQUIRED for the merge
     # (PR open, check not obsolete/superseded). Absent -> not required.
     required: bool = False
+    # Authoritative required-check proof from GraphQL CheckRun.isRequired for
+    # this PR number and head commit.  ``required=False`` is meaningful only
+    # when this proof was collected successfully.
+    required_check_evidence: bool = False
+    required_head_sha: str = ""
+    required_job_ids: list[str] = field(default_factory=list)
+    selected_run_ids: list[str] = field(default_factory=list)
+    required_checks: list[dict] = field(default_factory=list)
     # A newer workflow run (same workflow+branch/PR, or a newer SHA) exists.
     superseded: bool = False
     raw: dict = field(default_factory=dict)
@@ -290,14 +325,37 @@ class EvidenceSnapshot:
     @classmethod
     def from_dict(cls, data: Optional[dict]) -> "EvidenceSnapshot":
         data = data or {}
+        try:
+            captured_at = int(data.get("captured_at") or 0)
+        except (TypeError, ValueError):
+            captured_at = 0
+        required_job_ids = data.get("required_job_ids")
+        selected_run_ids = data.get("selected_run_ids")
         return cls(
-            captured_at=int(data.get("captured_at") or 0),
+            captured_at=captured_at,
             repo=str(data.get("repo") or ""),
             pr_number=data.get("pr_number"),
             head_sha=str(data.get("head_sha") or ""),
-            runs=list(data.get("runs") or []),
-            jobs=list(data.get("jobs") or []),
+            runs=list(data.get("runs") or []) if isinstance(data.get("runs"), list) else [],
+            jobs=list(data.get("jobs") or []) if isinstance(data.get("jobs"), list) else [],
             required=bool(data.get("required")),
+            required_check_evidence=bool(data.get("required_check_evidence")),
+            required_head_sha=str(data.get("required_head_sha") or ""),
+            required_job_ids=(
+                [str(v) for v in required_job_ids]
+                if isinstance(required_job_ids, list)
+                else []
+            ),
+            selected_run_ids=(
+                [str(v) for v in selected_run_ids]
+                if isinstance(selected_run_ids, list)
+                else []
+            ),
+            required_checks=(
+                list(data.get("required_checks") or [])
+                if isinstance(data.get("required_checks"), list)
+                else []
+            ),
             superseded=bool(data.get("superseded")),
             raw=data,
         )
@@ -311,8 +369,21 @@ class EvidenceSnapshot:
             "runs": self.runs,
             "jobs": self.jobs,
             "required": self.required,
+            "required_check_evidence": self.required_check_evidence,
+            "required_head_sha": self.required_head_sha,
+            "required_job_ids": self.required_job_ids,
+            "selected_run_ids": self.selected_run_ids,
+            "required_checks": self.required_checks,
             "superseded": self.superseded,
         }
+
+    def authoritative_pairs(self) -> Optional[dict]:
+        """Authoritative (jobId -> runId) map from the GraphQL rollup.
+
+        None means the rollup is missing/duplicated/conflicting — no retry
+        target may be derived from it (fail closed).
+        """
+        return _required_pair_map(self.required_checks)
 
     def evidence_complete(self) -> bool:
         """Fail-closed gate: is the snapshot complete enough to classify?
@@ -320,22 +391,123 @@ class EvidenceSnapshot:
         A stall classification requires every evidence field: a fresh
         timestamp, a named repo/PR/SHA, at least one run, and jobs for that
         run with steps visible. Missing any of these -> incomplete.
+
+        Correlation is exact-pair, never set-based: the authoritative GraphQL
+        rollup binds each required job id to ONE run id. Crossed pairs (job
+        row run_id disagrees with the rollup pair), duplicate/conflicting
+        rows, missing/extra pairs and endpoint/job run mismatches all fail
+        closed here so no later write can be derived from ambiguous evidence.
         """
-        if not self.captured_at or not self.repo:
+        if (
+            not isinstance(self.captured_at, int)
+            or isinstance(self.captured_at, bool)
+            or self.captured_at <= 0
+            or not self.repo
+            or self.repo.count("/") != 1
+        ):
             return False
-        if not self.pr_number or not self.head_sha:
+        try:
+            pr_number = int(self.pr_number or 0)
+        except (TypeError, ValueError):
             return False
-        if not self.runs:
+        if pr_number <= 0 or not self.head_sha:
             return False
-        if not self.jobs:
+        if not self.required_check_evidence:
             return False
-        # At least one job row must carry the fields the classifier reads.
+        if not self.required_head_sha or self.required_head_sha != self.head_sha:
+            return False
+        # An authoritative rollup with no required Action check proves that an
+        # optional queued workflow must not be classified or retried.
+        if not self.required:
+            return not self.required_job_ids
+        required_ids = {str(v) for v in self.required_job_ids}
+        selected_run_ids = {str(v) for v in self.selected_run_ids}
+        if not required_ids or not selected_run_ids or not self.runs or not self.jobs:
+            return False
+        if not all(value.isdigit() for value in required_ids | selected_run_ids):
+            return False
+
+        valid_statuses = {"queued", "in_progress", "completed", "waiting", "pending", "requested"}
+        valid_conclusions = {
+            None, "success", "failure", "neutral", "cancelled", "skipped",
+            "timed_out", "action_required", "stale", "startup_failure",
+        }
+        if not self.required_checks:
+            return False
+
+        # Authoritative rollup: exactly one unique (jobId -> runId) pair per
+        # required job. Duplicate/conflicting rows, or pairs referencing ids
+        # outside the declared required/selected sets, fail closed.
+        pairs = self.authoritative_pairs()
+        if pairs is None:
+            return False
+        if set(pairs) != required_ids or set(pairs.values()) != selected_run_ids:
+            return False
+        for check in self.required_checks:
+            if not isinstance(check, dict) or check.get("isRequired") is not True:
+                return False
+            job_id = str(check.get("jobId") or "")
+            run_id = str(check.get("runId") or "")
+            if pairs.get(job_id) != run_id:
+                return False
+            if job_id not in required_ids or run_id not in selected_run_ids:
+                return False
+            if check.get("status") not in valid_statuses or "conclusion" not in check:
+                return False
+            if check.get("conclusion") not in valid_conclusions:
+                return False
+
+        # REST run rows: every selected run id exactly once (duplicate run
+        # rows fail closed), bound to the current head sha.
+        run_rows: dict[str, int] = {}
+        for run in self.runs:
+            if not isinstance(run, dict):
+                return False
+            run_id = str(run.get("id") or "")
+            if not run_id.isdigit() or run_id not in selected_run_ids:
+                return False
+            if run.get("head_sha") != self.head_sha:
+                return False
+            if run.get("status") not in valid_statuses or "conclusion" not in run:
+                return False
+            if run.get("conclusion") not in valid_conclusions:
+                return False
+            if _parse_github_ts(run.get("created_at")) is None:
+                return False
+            run_rows[run_id] = run_rows.get(run_id, 0) + 1
+        if set(run_rows) != selected_run_ids or any(
+            count != 1 for count in run_rows.values()
+        ):
+            return False
+
+        # REST job rows: every required job exactly once, and each row must be
+        # bound to its OWN authoritative run id. A crossed pair (row run_id
+        # disagrees with the rollup pair for that job) or a duplicate row
+        # fails closed — no later write derives from ambiguous evidence.
+        job_rows: dict[str, int] = {}
         for job in self.jobs:
             if not isinstance(job, dict):
-                continue
-            if "status" in job and "id" in job:
-                return True
-        return False
+                return False
+            job_id = str(job.get("id") or "")
+            run_id = str(job.get("run_id") or "")
+            if job_id not in required_ids or not job_id.isdigit():
+                return False
+            if run_id != pairs.get(job_id) or not run_id.isdigit():
+                return False
+            if job.get("status") not in valid_statuses or "conclusion" not in job:
+                return False
+            if job.get("conclusion") not in valid_conclusions:
+                return False
+            if "steps" not in job or not isinstance(job.get("steps"), list):
+                return False
+            if _parse_github_ts(job.get("started_at")) is None:
+                return False
+            if job.get("status") == "completed" and _parse_github_ts(job.get("completed_at")) is None:
+                return False
+            job_rows[job_id] = job_rows.get(job_id, 0) + 1
+        return set(job_rows) == required_ids and all(
+            count == 1 for count in job_rows.values()
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -410,23 +582,27 @@ def job_is_running(job: dict) -> bool:
 
 def job_is_failed(job: dict) -> bool:
     """Real completed failure: execution started AND conclusion == failure."""
-    if _job_conclusion(job) != "failure":
+    if _job_status(job) != "completed" or _job_conclusion(job) != "failure":
         return False
-    # A job that reached a failure conclusion necessarily ran; still require
-    # execution proof so a malformed payload never fabricates a failure.
-    return job_execution_started(job) or _job_status(job) == "completed"
+    # A conclusion by itself is not proof of execution. Require the step
+    # records exposed for an executed Action job.
+    return job_execution_started(job)
 
 
 def job_is_queued(job: dict) -> bool:
     return _job_status(job) == "queued" and _job_conclusion(job) is None
 
 
-def run_has_failure_conclusion(run: dict) -> bool:
-    return str((run or {}).get("conclusion") or "") == "failure"
-
-
 def _run_created_at(run: dict) -> Optional[int]:
     return _parse_github_ts((run or {}).get("created_at"))
+
+
+def _required_jobs(snapshot: EvidenceSnapshot) -> list[dict]:
+    required_ids = {str(value) for value in snapshot.required_job_ids}
+    return [
+        job for job in snapshot.jobs
+        if isinstance(job, dict) and str(job.get("id")) in required_ids
+    ]
 
 
 def _max_queue_minutes(snapshot: EvidenceSnapshot, now: int) -> int:
@@ -438,7 +614,7 @@ def _max_queue_minutes(snapshot: EvidenceSnapshot, now: int) -> int:
     captured = snapshot.captured_at or now
     run_by_id = {str((r or {}).get("id")): r for r in snapshot.runs}
     longest = 0
-    for job in snapshot.jobs:
+    for job in _required_jobs(snapshot):
         if not job_is_queued(job):
             continue
         run = run_by_id.get(str((job or {}).get("run_id")))
@@ -485,7 +661,7 @@ DEFAULT_SNAPSHOT_MAX_AGE_SECONDS = 2 * 300
 def _snapshot_queued_job_ids(snapshot: EvidenceSnapshot) -> list[str]:
     return [
         str((j or {}).get("id"))
-        for j in snapshot.jobs
+        for j in _required_jobs(snapshot)
         if isinstance(j, dict) and job_is_queued(j)
     ]
 
@@ -493,14 +669,18 @@ def _snapshot_queued_job_ids(snapshot: EvidenceSnapshot) -> list[str]:
 def _snapshot_failed_job_ids(snapshot: EvidenceSnapshot) -> list[str]:
     return [
         str((j or {}).get("id"))
-        for j in snapshot.jobs
+        for j in _required_jobs(snapshot)
         if isinstance(j, dict) and job_is_failed(j)
     ]
 
 
 def _current_run_id(snapshot: EvidenceSnapshot) -> Optional[str]:
     """Id of the newest observed run (the one being evaluated)."""
-    runs = [r for r in snapshot.runs if isinstance(r, dict) and r.get("id")]
+    selected = {str(value) for value in snapshot.selected_run_ids}
+    runs = [
+        run for run in snapshot.runs
+        if isinstance(run, dict) and str(run.get("id")) in selected
+    ]
     if not runs:
         return None
 
@@ -613,13 +793,11 @@ def classify_external_ci_wait(
                       "obsolete) — no CI wait alert.",
         }
 
-    # CI_FAILED requires real execution proof then failure.
+    # CI_FAILED requires real job-level execution proof then failure. A run
+    # conclusion alone can be inconsistent or belong to an optional sibling;
+    # it never fabricates a failure for the selected required job set.
     failed_jobs = _snapshot_failed_job_ids(snapshot)
-    run_failed = any(
-        isinstance(r, dict) and run_has_failure_conclusion(r)
-        for r in snapshot.runs
-    )
-    if failed_jobs or run_failed:
+    if failed_jobs:
         return {
             "ci_state": CI_FAILED,
             "evidence_ok": True,
@@ -639,7 +817,7 @@ def classify_external_ci_wait(
     # A COMPLETED job (historical steps) is NOT running — terminal jobs fall
     # through to the COMPLETED/queue logic below.
     if any(
-        isinstance(j, dict) and job_is_running(j) for j in snapshot.jobs
+        job_is_running(job) for job in _required_jobs(snapshot)
     ):
         return {
             "ci_state": RUNNING,
@@ -717,7 +895,9 @@ _ATTENTION_BY_STATE = {
     CI_WAITING_LONG: "WARNING",
     CI_INFRA_STALLED: "ACTION_REQUIRED",
     CI_FAILED: "ACTION_REQUIRED",
-    CI_RECOVERING: "WARNING",
+    # Produit §1.5 / §6-F (prime rule Produit > UX, UX reserve 3): recovery is
+    # a bounded, journaled INFO signal — never the WARNING of a prolonged wait.
+    CI_RECOVERING: "INFO",
     RUNNING: "INFO",
     COMPLETED: "INFO",
     OWNER_ACTION_REQUIRED: "ACTION_REQUIRED",
@@ -917,6 +1097,11 @@ def build_operator_alert(
     owner_action = _owner_action_for_ci(state, retry_available)
     queue_minutes = int(classification.get("queue_minutes") or 0)
     evidence_ok = bool(classification.get("evidence_ok"))
+    if state == CI_WAITING and not evidence_ok:
+        # Evidence-missing signal (fail-closed): non-alarmist INFO per Produit
+        # §2 — it must never inherit the silent NONE of a healthy wait (a
+        # healthy CI_WAITING with evidence_ok=True stays NONE, zero events).
+        attention = "INFO"
     repo = classification.get("repo") or ""
     pr = classification.get("pr_number")
     pr_ref = f"PR #{pr}" if pr else (pr_url or "PR")
@@ -1018,6 +1203,17 @@ def build_operator_alert(
         "prUrl": pr_url,
         "retryAvailable": retry_available,
         "retryEvidence": retry_evidence,
+        "repo": repo,
+        "prNumber": pr,
+        "headSha": classification.get("head_sha") or "",
+        "runIds": sorted(str(value) for value in (classification.get("runIds") or [])),
+        "queuedJobIds": sorted(
+            str(value) for value in (classification.get("queuedJobIds") or [])
+        ),
+        "failedJobIds": sorted(
+            str(value) for value in (classification.get("failedJobIds") or [])
+        ),
+        "correlation": classification.get("correlation") or {},
         "capturedAt": classification.get("captured_at"),
         "reason": classification.get("reason"),
     }
@@ -1071,8 +1267,41 @@ def gh_available() -> bool:
 
 
 #: A ``gh api`` runner returns ``(status_code, body)`` where body is raw text
-#: or a parsed JSON value (dict/list/None).
-GHRunner = Optional[Callable[[list[str]], "tuple[int, Any]"]]
+#: or a parsed JSON value (dict/list/None). Malformed injected statuses are
+#: accepted by the type so the production path can fail closed on them.
+GHRunner = Optional[Callable[[list[str]], "tuple[Any, Any]"]]
+
+_REQUIRED_CHECKS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              contexts(first: 100) {
+                pageInfo { hasNextPage }
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    databaseId
+                    name
+                    status
+                    conclusion
+                    isRequired(pullRequestNumber: $number)
+                    checkSuite { workflowRun { databaseId } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+""".strip()
 
 
 def _gh_json(
@@ -1144,83 +1373,165 @@ def collect_external_ci_snapshot(
     )
     if status != 0 or not isinstance(pr, dict):
         return EvidenceSnapshot.from_dict(raw)
-    head_sha = head_sha or str(pr.get("head", {}).get("sha") or "")
-    raw["head_sha"] = head_sha
+    pr_head_sha = str(pr.get("head", {}).get("sha") or "")
+    raw["head_sha"] = pr_head_sha
     raw["pr_open"] = str(pr.get("state") or "") == "open"
-    # The check is "required" while the PR is open (still mergeable-targeted).
-    raw["required"] = raw["pr_open"]
+    if not pr_head_sha or (head_sha and str(head_sha) != pr_head_sha):
+        return EvidenceSnapshot.from_dict(raw)
+
+    # Authoritative authorization boundary: CheckRun.isRequired is evaluated
+    # by GitHub for this exact pull request. PR-open alone never grants retry
+    # permission. The rollup is anchored to headRefOid and exposes the Action
+    # job/run database IDs used for REST correlation below.
+    try:
+        owner, name = repo.split("/", 1)
+    except ValueError:
+        return EvidenceSnapshot.from_dict(raw)
+    status, required_rollup = _gh_json(
+        [
+            "graphql",
+            "-f", f"owner={owner}",
+            "-f", f"name={name}",
+            "-F", f"number={int(pr_number)}",
+            "-f", f"query={_REQUIRED_CHECKS_QUERY}",
+        ],
+        runner=runner,
+    )
+    try:
+        pull_request = required_rollup["data"]["repository"]["pullRequest"]
+        rollup_head = str(pull_request["headRefOid"] or "")
+        contexts = pull_request["commits"]["nodes"][0]["commit"][
+            "statusCheckRollup"
+        ]["contexts"]
+        has_next_page = contexts["pageInfo"]["hasNextPage"]
+        contexts = contexts["nodes"]
+    except (KeyError, IndexError, TypeError):
+        return EvidenceSnapshot.from_dict(raw)
+    if (
+        status != 0
+        or rollup_head != pr_head_sha
+        or has_next_page is not False
+        or not isinstance(contexts, list)
+    ):
+        return EvidenceSnapshot.from_dict(raw)
+
+    required_checks: list[dict] = []
+    malformed_required = False
+    for context in contexts:
+        if not isinstance(context, dict) or context.get("__typename") != "CheckRun":
+            continue
+        if context.get("isRequired") is not True:
+            continue
+        workflow_run = (context.get("checkSuite") or {}).get("workflowRun") or {}
+        job_id = str(context.get("databaseId") or "")
+        run_id = str(workflow_run.get("databaseId") or "")
+        if not job_id.isdigit() or not run_id.isdigit():
+            malformed_required = True
+            continue
+        required_checks.append(
+            {
+                "jobId": job_id,
+                "runId": run_id,
+                "name": str(context.get("name") or ""),
+                "status": str(context.get("status") or "").lower(),
+                "conclusion": (
+                    str(context.get("conclusion")).lower()
+                    if context.get("conclusion") is not None
+                    else None
+                ),
+                "isRequired": True,
+            }
+        )
+    if malformed_required:
+        return EvidenceSnapshot.from_dict(raw)
+    raw["required_check_evidence"] = True
+    raw["required_head_sha"] = rollup_head
+    raw["required_checks"] = required_checks
+    # Authoritative exact pairs, never independent sets: when the rollup lists
+    # a required check it must bind each job to exactly one run. A duplicate
+    # or conflicting required row (same job bound twice) fails closed here so
+    # no later REST row can be normalized into a crossed pair.
+    if required_checks and _required_pair_map(required_checks) is None:
+        return EvidenceSnapshot.from_dict(raw)
+    authoritative_pairs = _required_pair_map(required_checks) or {}
+    raw["required_job_ids"] = sorted(authoritative_pairs)
+    raw["selected_run_ids"] = sorted(
+        {run_id for run_id in authoritative_pairs.values()}
+    )
+    raw["required"] = bool(raw["pr_open"] and authoritative_pairs)
+    # No required Action check exists for this head. This is complete evidence
+    # for a silent, non-retrying exit even if an optional workflow is queued.
+    if not raw["required"]:
+        return EvidenceSnapshot.from_dict(raw)
 
     status, runs = _gh_json(
         [
-            f"repos/{repo}/actions/runs?head_sha={head_sha}&per_page=100",
+            f"repos/{repo}/actions/runs?head_sha={pr_head_sha}&per_page=100",
             "--jq", ".workflow_runs",
         ],
         runner=runner,
     )
     if status != 0 or not isinstance(runs, list):
         return EvidenceSnapshot.from_dict(raw)
-    raw["runs"] = runs
-
-    # Order runs newest-first, take the newest (pull_request event preferred).
-    def _run_key(run: dict) -> tuple[int, int]:
-        return (
-            int((run or {}).get("id") or 0),
-            int(_parse_github_ts((run or {}).get("created_at")) or 0),
-        )
-
-    ordered = sorted(runs, key=_run_key, reverse=True)
-    current: Optional[dict] = None
-    for run in ordered:
-        if str((run or {}).get("head_sha") or "") == head_sha:
-            current = run
-            break
-    if current is None and ordered:
-        current = ordered[0]
-
-    if current is None:
+    selected_ids = set(raw["selected_run_ids"])
+    selected_runs = [
+        run for run in runs
+        if isinstance(run, dict)
+        and str(run.get("id") or "") in selected_ids
+        and str(run.get("head_sha") or "") == pr_head_sha
+    ]
+    if {str(run.get("id")) for run in selected_runs} != selected_ids:
         return EvidenceSnapshot.from_dict(raw)
-
-    run_id = (current or {}).get("id")
-    raw["run"] = current
+    raw["runs"] = selected_runs
     raw["superseded"] = False
-    # A run is superseded when a NEWER run exists for the same head_sha that
-    # replaces the observed one (higher id = started later for same SHA, or a
-    # later pull_request event run).
-    for run in ordered:
-        if run is current:
-            break
-        if str((run or {}).get("head_sha") or "") == head_sha:
-            raw["superseded"] = True
-            break
 
-    status, jobs = _gh_json(
-        [
-            f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100",
-            "--jq", ".jobs",
-        ],
-        runner=runner,
-    )
-    if status != 0 or not isinstance(jobs, list):
-        return EvidenceSnapshot.from_dict(raw)
-    # Attach step-level facts (steps present + started) — the execution proof.
+    # Fetch every Action run referenced by the authoritative required-check
+    # rollup, then retain exactly the required job rows — each one must come
+    # from ITS authoritative run and declare that same run id (endpoint/job
+    # run binding). A required job found under a different run, or appearing
+    # twice, is crossed/duplicate evidence and fails closed here. Missing
+    # fields remain missing; normalization must never turn absent ``steps``
+    # into proof of 0.
     normalized_jobs: list[dict] = []
-    for job in jobs:
-        if not isinstance(job, dict):
-            continue
-        steps = job.get("steps") or []
-        normalized_jobs.append(
-            {
-                "id": job.get("id"),
-                "run_id": job.get("run_id"),
-                "name": job.get("name"),
-                "status": job.get("status"),
-                "conclusion": job.get("conclusion"),
-                "started_at": job.get("started_at"),
-                "completed_at": job.get("completed_at"),
-                "steps": steps,
-                "html_url": job.get("html_url"),
-            }
+    seen_job_ids: set[str] = set()
+    for run_id in sorted(selected_ids):
+        status, jobs = _gh_json(
+            [
+                f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100",
+                "--jq", ".jobs",
+            ],
+            runner=runner,
         )
+        if status != 0 or not isinstance(jobs, list):
+            return EvidenceSnapshot.from_dict(raw)
+        for job in jobs:
+            if not isinstance(job, dict) or str(job.get("id") or "") not in authoritative_pairs:
+                continue
+            job_id = str(job.get("id") or "")
+            rest_run_id = str(job.get("run_id") or "")
+            if (
+                job_id in seen_job_ids
+                or rest_run_id != run_id
+                or authoritative_pairs[job_id] != rest_run_id
+            ):
+                # Duplicate required job row or endpoint/job run mismatch —
+                # the REST row does not match the authoritative pair.
+                return EvidenceSnapshot.from_dict(raw)
+            seen_job_ids.add(job_id)
+            normalized_jobs.append(
+                {
+                    key: job.get(key)
+                    for key in (
+                        "id", "run_id", "name", "status", "conclusion",
+                        "started_at", "completed_at", "steps", "html_url",
+                    )
+                    if key in job
+                }
+            )
+    if seen_job_ids != set(authoritative_pairs):
+        # A required job id was never observed in its authoritative run's
+        # jobs payload — missing pair evidence, fail closed.
+        return EvidenceSnapshot.from_dict(raw)
     raw["jobs"] = normalized_jobs
     return EvidenceSnapshot.from_dict(raw)
 
@@ -1235,6 +1546,46 @@ RETRY_NONE = "none"
 
 # Max number of retry attempts per stall episode (budget: exactly ONE).
 RETRY_BUDGET_PER_EPISODE = 1
+RETRY_PERSISTED_BODY_MAX_CHARS = 512
+
+
+def _http_status(value: Any) -> Optional[int]:
+    try:
+        status = int(value)
+    except (TypeError, ValueError):
+        return None
+    return status if 100 <= status <= 599 else None
+
+
+def _sanitize_retry_text(value: Any) -> str:
+    text = str(value or "").replace("\x00", " ")
+    text = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [REDACTED]", text)
+    text = re.sub(
+        r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]+)\b",
+        "[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password)\s*[=:]\s*[^\s,;]+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    text = " ".join(text.split())
+    if len(text) > RETRY_PERSISTED_BODY_MAX_CHARS:
+        text = text[: RETRY_PERSISTED_BODY_MAX_CHARS - 1] + "…"
+    return text
+
+
+def _sanitize_retry_body(body: Any) -> Any:
+    if body is None:
+        return None
+    if isinstance(body, dict):
+        sanitized = {}
+        for key in ("message", "error", "status", "documentation_url"):
+            if key in body and body.get(key) is not None:
+                sanitized[key] = _sanitize_retry_text(body.get(key))
+        return sanitized or None
+    return _sanitize_retry_text(body)
 
 
 @dataclass
@@ -1259,7 +1610,7 @@ class RetryResult:
             "accepted": self.accepted,
             "level": self.level,
             "statusCode": self.status_code,
-            "body": self.body,
+            "body": _sanitize_retry_body(self.body),
             "jobId": self.job_id,
             "runId": self.run_id,
             "attemptedAt": self.attempted_at,
@@ -1270,15 +1621,16 @@ def _gh_post(
     args: list[str],
     *,
     runner: GHRunner = None,
-) -> tuple[int, Any]:
+) -> tuple[Optional[int], Any]:
     """POST via gh api. Returns (status_code, parsed_body_or_text)."""
     if runner is not None:
-        return runner(args)
+        status, body = runner(args)
+        return _http_status(status), _sanitize_retry_body(body)
     if not gh_available():
-        return 1, None
+        return None, None
     try:
         proc = subprocess.run(
-            ["gh", "api", "--method", "POST", *args],
+            ["gh", "api", "--include", "--method", "POST", *args],
             capture_output=True,
             text=True,
             timeout=GH_TIMEOUT_SECONDS,
@@ -1286,18 +1638,36 @@ def _gh_post(
             errors="replace",
         )
     except subprocess.TimeoutExpired:
-        return 1, None
+        return None, None
     except Exception:
-        return 1, None
-    body = (proc.stdout or "").strip() or (proc.stderr or "").strip()
-    if proc.returncode != 0:
-        return proc.returncode, (body or None)
-    if not body:
-        return proc.returncode, {}
+        return None, None
+
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    stdout_status_matches = re.findall(r"(?im)^HTTP/\S+\s+(\d{3})\b", stdout)
+    status_matches = stdout_status_matches or re.findall(
+        r"(?i)\bHTTP\s+(\d{3})\b", stderr
+    )
+    status = _http_status(status_matches[-1]) if status_matches else None
+    # gh exit 0 proves an accepted API response. --include normally preserves
+    # the exact HTTP code; normalize to 200 only for older gh builds that omit
+    # headers rather than confusing the OS return code with HTTP status.
+    if proc.returncode == 0 and status is None:
+        status = 200
+    if proc.returncode != 0 and status is None:
+        return None, _sanitize_retry_body(stderr or stdout)
+
+    body_text = stdout or stderr
+    if stdout_status_matches:
+        sections = re.split(r"\r?\n\r?\n", stdout)
+        body_text = sections[-1] if len(sections) > 1 else ""
+    body_text = body_text.strip()
+    if not body_text:
+        return status, None
     try:
-        return proc.returncode, json.loads(body)
+        return status, _sanitize_retry_body(json.loads(body_text))
     except Exception:
-        return proc.returncode, body
+        return status, _sanitize_retry_body(body_text)
 
 
 def request_job_rerun(
@@ -1310,9 +1680,9 @@ def request_job_rerun(
     args = [f"repos/{repo}/actions/jobs/{job_id}/rerun"]
     status, body = _gh_post(args, runner=runner)
     return RetryResult(
-        accepted=bool(status) and 200 <= int(status) < 300,
+        accepted=status is not None and 200 <= status < 300,
         level=RETRY_JOB_LEVEL,
-        status_code=int(status) if status else None,
+        status_code=status,
         body=body,
         job_id=str(job_id),
         attempted_at=int(time.time()),
@@ -1330,9 +1700,9 @@ def request_rerun_failed_jobs(
     args = [f"repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs"]
     status, body = _gh_post(args, runner=runner)
     return RetryResult(
-        accepted=bool(status) and 200 <= int(status) < 300,
+        accepted=status is not None and 200 <= status < 300,
         level=RETRY_WORKFLOW_LEVEL,
-        status_code=int(status) if status else None,
+        status_code=status,
         body=body,
         run_id=str(run_id),
         attempted_at=int(time.time()),
@@ -1343,38 +1713,54 @@ def attempt_bounded_rerun(
     repo: str,
     *,
     queued_job_ids: list[str],
+    job_run_ids: Optional[dict] = None,
     run_id: Optional[str] = None,
     runner: GHRunner = None,
 ) -> RetryResult:
     """Attempt ONE bounded AUTO rerun per stall episode.
 
-    Targeting: job-level rerun of the queued/stuck job(s) first. When no
-    concrete job id is available (or the job-level endpoint is refused with a
-    404/410-style "unavailable"), fall back to the affected workflow's
-    ``rerun-failed-jobs`` — never a whole-PR rerun, never cancel/re-push.
+    Targeting: job-level rerun of the first concrete queued job (minimal
+    target — exactly one job POST per episode). When that job's endpoint is
+    refused with an explicit 404/410-style "unavailable", fall back to the
+    affected workflow's ``rerun-failed-jobs`` bound to THAT JOB'S OWN run id
+    (the authoritative pair from ``job_run_ids``) — never to another selected
+    run. ``run_id`` is the legacy single-run binding used only when no
+    per-job map is supplied; when ``job_run_ids`` is provided it is
+    authoritative, and a job without a mapped run never triggers a workflow
+    fallback (missing-pair evidence fails closed). Never a whole-PR rerun,
+    never cancel/re-push.
 
-    Any 4xx/5xx refusal returns ``accepted=False`` with the API evidence; the
-    caller escalates (OWNER_ACTION_REQUIRED). A 403 on an ACTIVE run is the
-    documented real-world outcome (GitHub refuses rerun of queued jobs while
-    the workflow run is still running).
+    Any 4xx/5xx refusal returns ``accepted=False`` with the API evidence after
+    exactly one job-level POST; a 403 on an ACTIVE run is the documented
+    real-world outcome (GitHub refuses rerun of queued jobs while the
+    workflow run is still running).
     """
-    # Prefer concrete job-level rerun for each queued job (minimal target).
+    # Prefer concrete job-level rerun (minimal target): the first concrete
+    # queued job. Auth/refusal/validation/server/timeout or a malformed
+    # response stops after exactly this one job-level write.
     for job_id in queued_job_ids:
         if not str(job_id).isdigit():
             continue
         result = request_job_rerun(repo, int(job_id), runner=runner)
         if result.accepted:
             return result
-        # A 403/other refusal on job-level -> do NOT loop; try the bounded
-        # workflow-level fallback once when a run id is known.
-        if run_id and str(run_id).isdigit():
-            fallback = request_rerun_failed_jobs(repo, int(run_id), runner=runner)
+        # Only an explicit endpoint-unavailable response authorizes the wider
+        # workflow-level fallback, and only on the JOB'S OWN run (exact pair).
+        own_run_id: Optional[str] = None
+        if job_run_ids is not None:
+            own_run_id = job_run_ids.get(str(job_id))
+        else:
+            own_run_id = run_id
+        if result.status_code in {404, 410} and own_run_id and str(own_run_id).isdigit():
+            fallback = request_rerun_failed_jobs(repo, int(own_run_id), runner=runner)
             if fallback.accepted:
                 fallback.job_id = str(job_id)
                 return fallback
             # Keep the richer refusal evidence (job-level first).
             return result
         return result
+    # No concrete queued job id available: workflow-level fallback only when
+    # the caller supplied an explicit single run id (legacy single-run call).
     if run_id and str(run_id).isdigit():
         return request_rerun_failed_jobs(repo, int(run_id), runner=runner)
     return RetryResult(
@@ -1407,10 +1793,10 @@ def _alert_fingerprint(alert: dict) -> str:
         "ciState": alert.get("ciState"),
         "queued": sorted(alert.get("queuedJobIds") or []),
         "failed": sorted(alert.get("failedJobIds") or []),
+        "runs": sorted(alert.get("runIds") or []),
         "repo": alert.get("repo") or "",
         "pr": alert.get("prNumber"),
         "head": alert.get("headSha") or "",
-        "captured": alert.get("capturedAt"),
     }
     payload = json.dumps(raw, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
@@ -1461,14 +1847,17 @@ def emit_external_ci_wait_alert(
     except Exception:
         return False
     fingerprint = _alert_fingerprint(alert)
-    prior = last_external_ci_wait_event(conn, task_id)
-    if prior and (prior.get("fingerprint") or _alert_fingerprint(prior)) == fingerprint:
-        return False
-
     body = body_override or render_alert_text(alert)
     marker_line = f"{EXTERNAL_CI_MARKER} — {alert.get('externalDependencyStatus')}"
     try:
         with kb.write_txn(conn):
+            # The read and write share one BEGIN IMMEDIATE transaction so two
+            # evaluators cannot both emit the same stable evidence fingerprint.
+            prior = last_external_ci_wait_event(conn, task_id)
+            if prior and (
+                prior.get("fingerprint") or _alert_fingerprint(prior)
+            ) == fingerprint:
+                return False
             kb.add_comment(conn, task_id, author, f"{marker_line}\n{body}")
             kb._append_event(
                 conn,
@@ -1606,25 +1995,133 @@ def retry_observation_expired(
     return (now_i - attempted_at) > int(retry_window_seconds)
 
 
-def record_retry_attempt(
+def _latest_episode_closure_id(conn: Any, task_id: str) -> int:
+    """Return the newest event id that closes a retry episode."""
+    try:
+        rows = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY id DESC",
+            (task_id, EXTERNAL_CI_WAIT_EVENT_KIND),
+        ).fetchall()
+    except Exception:
+        return 0
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+        except Exception:
+            continue
+        if str((payload or {}).get("ciState") or "") in _EPISODE_CLOSING_STATES:
+            return int(row["id"])
+    return 0
+
+
+def _retry_episode_key(
+    task_id: str,
+    snapshot: EvidenceSnapshot,
+    classification: dict,
+    closure_event_id: int,
+) -> str:
+    raw = {
+        "task": task_id,
+        "repo": snapshot.repo,
+        "pr": snapshot.pr_number,
+        "head": snapshot.head_sha,
+        "runs": sorted(snapshot.selected_run_ids),
+        "jobs": sorted(classification.get("queuedJobIds") or []),
+        "generation": int(closure_event_id),
+    }
+    encoded = json.dumps(raw, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+
+
+def reserve_retry_attempt(
     conn: Any,
     task_id: str,
+    snapshot: EvidenceSnapshot,
+    classification: dict,
+    *,
+    attempted_at: int,
+    run_id: Optional[str],
+) -> Optional[dict]:
+    """Atomically reserve the one write allowed for the current stall episode."""
+    try:
+        from hermes_cli import kanban_db as kb
+    except Exception:
+        return None
+    try:
+        with kb.write_txn(conn):
+            closure_id = _latest_episode_closure_id(conn, task_id)
+            existing = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? "
+                "AND id > ? LIMIT 1",
+                (task_id, EXTERNAL_CI_RETRY_EVENT_KIND, closure_id),
+            ).fetchone()
+            if existing is not None:
+                return None
+            episode_key = _retry_episode_key(
+                task_id, snapshot, classification, closure_id,
+            )
+            payload = {
+                "reservationState": "reserved",
+                "episodeKey": episode_key,
+                "accepted": False,
+                "level": RETRY_NONE,
+                "statusCode": None,
+                "body": None,
+                "jobId": next(iter(classification.get("queuedJobIds") or []), None),
+                "runId": run_id,
+                "attemptedAt": int(attempted_at),
+                "correlation": {
+                    "repo": snapshot.repo,
+                    "prNumber": snapshot.pr_number,
+                    "headSha": snapshot.head_sha,
+                    "runIds": sorted(snapshot.selected_run_ids),
+                    "requiredJobIds": sorted(snapshot.required_job_ids),
+                },
+            }
+            kb._append_event(
+                conn, task_id, EXTERNAL_CI_RETRY_EVENT_KIND, payload,
+            )
+            row = conn.execute("SELECT last_insert_rowid() AS id").fetchone()
+            return {
+                "eventId": int(row["id"]),
+                "episodeKey": episode_key,
+                "payload": payload,
+            }
+    except Exception:
+        return None
+
+
+def finalize_retry_attempt(
+    conn: Any,
+    task_id: str,
+    reservation: dict,
     result: RetryResult,
 ) -> bool:
-    """Persist a bounded retry attempt (accepted or refused) for audit."""
+    """Finalize exactly the durable reservation created before the POST."""
     try:
         from hermes_cli import kanban_db as kb
     except Exception:
         return False
+    payload = {
+        **(reservation.get("payload") or {}),
+        **result.to_dict(),
+        "reservationState": "finalized",
+        "episodeKey": reservation.get("episodeKey"),
+    }
     try:
         with kb.write_txn(conn):
-            kb._append_event(
-                conn,
-                task_id,
-                EXTERNAL_CI_RETRY_EVENT_KIND,
-                result.to_dict(),
+            cur = conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ? AND task_id = ? "
+                "AND kind = ?",
+                (
+                    json.dumps(payload, ensure_ascii=False),
+                    int(reservation.get("eventId") or 0),
+                    task_id,
+                    EXTERNAL_CI_RETRY_EVENT_KIND,
+                ),
             )
-        return True
+            return cur.rowcount == 1
     except Exception:
         return False
 
@@ -1685,39 +2182,47 @@ def evaluate_external_ci_wait(
     if policy is None:
         policy = ci_wait_policy_from_config(config)
 
+    # Resolve the umbrella override BEFORE classification. Reported thresholds
+    # and behavior must be the same effective policy.
+    effective = resolve_ci_wait_policy(policy, umbrella_id)
     classification = classify_external_ci_wait(
-        snapshot, policy=policy, now=now_i,
+        snapshot, policy=effective, now=now_i,
     )
     classification["repo"] = snapshot.repo
     classification["pr_number"] = snapshot.pr_number
     classification["head_sha"] = snapshot.head_sha
     classification["captured_at"] = snapshot.captured_at
-    classification["queuedJobIds"] = [
-        str((j or {}).get("id")) for j in snapshot.jobs if job_is_queued(j)
-    ]
-    classification["failedJobIds"] = [
-        str((j or {}).get("id")) for j in snapshot.jobs if job_is_failed(j)
-    ]
+    classification["runIds"] = sorted(snapshot.selected_run_ids)
+    classification["queuedJobIds"] = _snapshot_queued_job_ids(snapshot)
+    classification["failedJobIds"] = _snapshot_failed_job_ids(snapshot)
+    classification["correlation"] = {
+        "requiredCheckEvidence": snapshot.required_check_evidence,
+        "requiredHeadSha": snapshot.required_head_sha,
+        "requiredJobIds": sorted(snapshot.required_job_ids),
+        "selectedRunIds": sorted(snapshot.selected_run_ids),
+        "requiredChecks": snapshot.required_checks,
+    }
     out["classification"] = classification
 
     state = classification.get("ci_state")
     retry_available = False
     retry_result: Optional[dict] = None
 
-    # Resolve the effective retry window (config / mission override) so the
-    # post-retry observation window matches the operator policy.
-    effective = resolve_ci_wait_policy(policy, umbrella_id)
     retry_window_seconds = int(effective["retry_window_minutes"]) * 60
 
-    # Determine the queued run id (informational evidence for the retry call).
-    queued_run_id: Optional[str] = None
-    run_by_job: dict = {}
-    for job in snapshot.jobs:
-        rid = (job or {}).get("run_id")
-        if rid is not None:
-            run_by_job[str((job or {}).get("id"))] = str(rid)
-    for jid in classification.get("queuedJobIds") or []:
-        queued_run_id = run_by_job.get(jid) or queued_run_id
+    # Bind retry writes to the authoritative (jobId -> runId) pairs. Each
+    # queued job belongs to exactly one run; the workflow-level fallback for
+    # a job must target THAT job's own run (exact pair), never another
+    # selected run. ``evidence_complete`` already guaranteed the REST rows
+    # agree with the rollup pairs, so this map is the single source of truth.
+    queued_job_ids = list(classification.get("queuedJobIds") or [])
+    job_run_ids: dict = snapshot.authoritative_pairs() or {}
+    first_queued_job_id = next(iter(queued_job_ids), None)
+    queued_run_id = (
+        job_run_ids.get(str(first_queued_job_id))
+        if first_queued_job_id is not None
+        else None
+    )
 
     # --- Post-retry observation overlay ------------------------------------
     # An ACCEPTED bounded retry opens an observation window: while the retried
@@ -1764,48 +2269,78 @@ def evaluate_external_ci_wait(
         state == CI_INFRA_STALLED
         and classification.get("evidence_ok")
         and auto_remediation
-        and not retry_attempted_for_episode(conn, task_id)
     ):
-        # 2.2 prominent alert (retry about to be launched -> OWNER ACTION NONE).
-        stall_alert = build_operator_alert(
+        reservation = reserve_retry_attempt(
+            conn,
+            task_id,
+            snapshot,
             classification,
-            mission_title="",
-            pr_url="",
-            retry_available=True,
-            retry_evidence=None,
-        )
-        stall_alert["umbrellaTaskId"] = umbrella_id
-        stall_alert["thresholds"] = {
-            "warningMinutes": effective["warning_minutes"],
-            "stallMinutes": effective["stall_minutes"],
-            "retryWindowMinutes": effective["retry_window_minutes"],
-            "warningEnabled": effective["warning_enabled"],
-        }
-        stall_alert_emitted = emit_external_ci_wait_alert(conn, task_id, stall_alert)
-
-        result = attempt_bounded_rerun(
-            snapshot.repo,
-            queued_job_ids=classification.get("queuedJobIds") or [],
+            attempted_at=now_i,
             run_id=queued_run_id,
-            runner=runner,
         )
-        record_retry_attempt(conn, task_id, result)
-        retry_result = result.to_dict()
-        if result.accepted:
-            classification["ci_state"] = CI_RECOVERING
-            classification["reason"] = (
-                "Bounded AUTO job-level rerun accepted by the GitHub API — "
-                "observing within the retry window."
+        if reservation is not None:
+            # Prominent alert is visible before the network write, while the
+            # hidden atomic reservation already prevents another evaluator.
+            stall_alert = build_operator_alert(
+                classification,
+                mission_title="",
+                pr_url="",
+                retry_available=True,
+                retry_evidence=None,
             )
+            stall_alert["umbrellaTaskId"] = umbrella_id
+            stall_alert["thresholds"] = {
+                "warningMinutes": effective["warning_minutes"],
+                "stallMinutes": effective["stall_minutes"],
+                "retryWindowMinutes": effective["retry_window_minutes"],
+                "warningEnabled": effective["warning_enabled"],
+            }
+            stall_alert_emitted = emit_external_ci_wait_alert(conn, task_id, stall_alert)
+
+            result = attempt_bounded_rerun(
+                snapshot.repo,
+                queued_job_ids=queued_job_ids,
+                job_run_ids=job_run_ids,
+                run_id=queued_run_id,
+                runner=runner,
+            )
+            finalize_retry_attempt(conn, task_id, reservation, result)
+            retry_result = {
+                **result.to_dict(),
+                "reservationState": "finalized",
+                "episodeKey": reservation.get("episodeKey"),
+            }
+            if result.accepted:
+                classification["ci_state"] = CI_RECOVERING
+                classification["reason"] = (
+                    "Bounded AUTO job-level rerun accepted by the GitHub API — "
+                    "observing within the retry window."
+                )
+            else:
+                classification["ci_state"] = OWNER_ACTION_REQUIRED
+                classification["reason"] = (
+                    "Bounded AUTO rerun refused by the GitHub API (evidence: "
+                    f"status {result.status_code}) — Hermes cannot retry; "
+                    "OWNER_ACTION_REQUIRED."
+                )
+            state = classification.get("ci_state")
+            retry_available = False
         else:
-            classification["ci_state"] = OWNER_ACTION_REQUIRED
-            classification["reason"] = (
-                "Bounded AUTO rerun refused by the GitHub API (evidence: "
-                f"status {result.status_code}) — Hermes cannot retry; "
-                "OWNER_ACTION_REQUIRED."
-            )
-        state = classification.get("ci_state")
-        retry_available = False
+            last_retry = last_retry_attempt(conn, task_id)
+            if last_retry and last_retry.get("reservationState") == "reserved":
+                classification["reason"] = (
+                    "Bounded AUTO rerun reservation is in flight; no concurrent "
+                    "GitHub write is authorized."
+                )
+                retry_available = True
+            else:
+                classification["ci_state"] = OWNER_ACTION_REQUIRED
+                classification["reason"] = (
+                    "Bounded AUTO rerun already attempted this episode — Hermes "
+                    "cannot retry; OWNER_ACTION_REQUIRED."
+                )
+                state = OWNER_ACTION_REQUIRED
+                retry_available = False
     elif state == CI_INFRA_STALLED:
         # No retry this tick: auto remediation is disabled OR the episode
         # budget is already spent (a previous attempt/refusal was recorded).

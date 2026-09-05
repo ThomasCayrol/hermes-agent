@@ -1,9 +1,9 @@
 """Live-path validation for kanban_external_ci (run manually, not in CI).
 
 Uses the real authenticated gh CLI against ThomasCayrol/hermes-agent to prove
-the collector parses actual GitHub REST payloads and the classifier behaves on
-real evidence (PR #6: closed now, but its historical queued/steps=0 jobs are
-still readable — the exact incident shape from the Product contract).
+the collector parses REST job/run evidence plus authoritative GraphQL
+CheckRun.isRequired data for the current PR head. PR #6's queued jobs were
+optional; this probe proves they cannot authorize a retry.
 
 Read-only: only GET requests are issued; no rerun POST is attempted.
 """
@@ -30,7 +30,7 @@ def main() -> int:
     )
     print(f"captured_at={snap.captured_at} repo={snap.repo} pr={snap.pr_number}")
     print(f"head_sha={snap.head_sha} required={snap.required} superseded={snap.superseded}")
-    print(f"runs={len(snap.runs)} jobs={len(snap.jobs)}")
+    print(f"runs={len(snap.runs)} jobs={len(snap.jobs)} required_jobs={snap.required_job_ids}")
     print(f"evidence_complete={snap.evidence_complete()}")
     queued = [
         (str((j or {}).get("id")), (j or {}).get("name"), (j or {}).get("status"))
@@ -52,16 +52,13 @@ def main() -> int:
 
     result = kc.classify_external_ci_wait(snap, now=int(time.time()))
     print(f"classification={json.dumps(result, ensure_ascii=False)}")
-    # PR #6 is now CLOSED -> required=False -> wait moot -> no stall alert.
+    # PR #6 is closed and its Action jobs are not required checks. The
+    # authoritative rollup therefore makes the wait moot and non-retriable.
+    assert snap.required_check_evidence is True
+    assert snap.required_job_ids == []
     assert snap.required is False
     assert result["ci_state"] in (kc.COMPLETED, kc.CI_WAITING), result["ci_state"]
-    print("classifier on closed PR: silent (no stall alert) OK")
-
-    # 2) Same payload but forced required=True to exercise the real queued
-    # evidence through the stall classifier (the historical incident state).
-    snap.required = True
-    result2 = kc.classify_external_ci_wait(snap, now=int(time.time()))
-    print(f"forced-required classification={json.dumps(result2, ensure_ascii=False)}")
+    print("optional/closed PR: silent and no retry authorization OK")
     print("live-path validation OK")
     return 0
 
