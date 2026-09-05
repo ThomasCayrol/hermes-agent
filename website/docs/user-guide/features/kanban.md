@@ -747,6 +747,8 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
+| `terminal_watchdog_window_seconds` | `120` | Bounded window for a terminal handoff persisted as `STARTING`. If no live execution witness (same-mission running run / fresh heartbeat) materialises within the window, the dispatcher watchdog classifies the mission: a proven-terminal probe/test mission is auto-archived; a real mission is corrected via a recomputed `terminal_handoff` to `APPROVAL_REQUIRED` / `AWAITING_APPROVAL` (never indefinite `STARTING`). A freshly-spawned worker gets a full window to claim + heartbeat before any correction. |
+| `terminal_probe_cleanup_limit` | `100` | Max proven-terminal probe/test missions auto-archived per dispatcher tick (bounded; excess defers to the next tick). `0` disables probe auto-archive entirely. Auto-archive calls `archive_task` only — never a destructive delete — and preserves all runs/events/comments. |
 
 And the two auxiliary LLM slots:
 

@@ -1463,6 +1463,59 @@ class GatewayKanbanWatchersMixin:
         # pass. Set false to keep orphans frozen for manual forensics.
         reconcile_orphans = bool(kanban_cfg.get("reconcile_orphans", True))
 
+        # Bounded terminal-STARTING watchdog window: a STARTING handoff is a
+        # transitional state, never a resting one. The watchdog only acts
+        # once this many seconds have elapsed without a live execution
+        # witness (default 120s ~= two 60s ticks; a freshly-spawned worker
+        # gets a full window to claim + heartbeat before any correction).
+        raw_watchdog_window = kanban_cfg.get(
+            "terminal_watchdog_window_seconds",
+            _kb.DEFAULT_TERMINAL_WATCHDOG_WINDOW_SECONDS,
+        )
+        try:
+            watchdog_window = int(raw_watchdog_window)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.terminal_watchdog_window_seconds=%r; "
+                "using default %d",
+                raw_watchdog_window,
+                _kb.DEFAULT_TERMINAL_WATCHDOG_WINDOW_SECONDS,
+            )
+            watchdog_window = _kb.DEFAULT_TERMINAL_WATCHDOG_WINDOW_SECONDS
+        if watchdog_window < 0:
+            logger.warning(
+                "kanban dispatcher: kanban.terminal_watchdog_window_seconds=%r is "
+                "negative; using default %d",
+                raw_watchdog_window,
+                _kb.DEFAULT_TERMINAL_WATCHDOG_WINDOW_SECONDS,
+            )
+            watchdog_window = _kb.DEFAULT_TERMINAL_WATCHDOG_WINDOW_SECONDS
+
+        # Bounded per-tick auto-archive budget for proven-terminal probe/test
+        # missions (default 100). Excess probes defer to the next tick.
+        raw_cleanup_limit = kanban_cfg.get(
+            "terminal_probe_cleanup_limit",
+            _kb.DEFAULT_TERMINAL_PROBE_CLEANUP_LIMIT,
+        )
+        try:
+            probe_cleanup_limit = int(raw_cleanup_limit)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.terminal_probe_cleanup_limit=%r; "
+                "using default %d",
+                raw_cleanup_limit,
+                _kb.DEFAULT_TERMINAL_PROBE_CLEANUP_LIMIT,
+            )
+            probe_cleanup_limit = _kb.DEFAULT_TERMINAL_PROBE_CLEANUP_LIMIT
+        if probe_cleanup_limit < 0:
+            logger.warning(
+                "kanban dispatcher: kanban.terminal_probe_cleanup_limit=%r is "
+                "negative; using default %d",
+                raw_cleanup_limit,
+                _kb.DEFAULT_TERMINAL_PROBE_CLEANUP_LIMIT,
+            )
+            probe_cleanup_limit = _kb.DEFAULT_TERMINAL_PROBE_CLEANUP_LIMIT
+
         # Read kanban.default_assignee — fallback profile for tasks
         # created without an explicit assignee (e.g. via the dashboard).
         # When set, the dispatcher applies it to unassigned ready tasks
@@ -1629,10 +1682,17 @@ class GatewayKanbanWatchersMixin:
                     )
                 # Terminal-handoff watchdog: correct persisted STARTING
                 # auto-continuations that never gained a live execution
-                # run/witness/heartbeat (bounded + idempotent). Best-effort —
-                # a watchdog failure must not break dispatch.
+                # run/witness/heartbeat within the bounded window (bounded +
+                # idempotent). A proven-terminal probe/test mission is
+                # auto-archived instead; a real mission receives a
+                # recomputed corrected terminal_handoff. Best-effort — a
+                # watchdog failure must not break dispatch.
                 try:
-                    corrected = _kb.watchdog_terminal_handoffs(conn, board=slug)
+                    corrected = _kb.watchdog_terminal_handoffs(
+                        conn,
+                        board=slug,
+                        window_seconds=watchdog_window,
+                    )
                     if corrected:
                         logger.info(
                             "kanban dispatcher: watchdog corrected stuck STARTING handoff(s) %s on board %s",
@@ -1641,6 +1701,26 @@ class GatewayKanbanWatchersMixin:
                 except Exception:
                     logger.exception(
                         "kanban dispatcher: terminal-handoff watchdog failed on board %s",
+                        slug,
+                    )
+                # Terminal probe/test auto-archive: after every dispatch tick,
+                # archive a bounded batch of proven-terminal probe missions
+                # (fail-closed; archive_task only, never delete). Best-effort.
+                try:
+                    archived_probes = _kb.cleanup_terminal_probe_missions(
+                        conn,
+                        limit=probe_cleanup_limit,
+                        window_seconds=watchdog_window,
+                    )
+                    if archived_probes:
+                        logger.info(
+                            "kanban dispatcher: auto-archived terminal probe/test "
+                            "mission umbrella(s) %s on board %s",
+                            ",".join(archived_probes), slug,
+                        )
+                except Exception:
+                    logger.exception(
+                        "kanban dispatcher: terminal probe auto-archive failed on board %s",
                         slug,
                     )
                 return result

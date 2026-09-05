@@ -140,6 +140,7 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 # carry no role. The terminal-handoff observer only fires for ``gate`` cards
 # and writes the handoff onto the mission's ``umbrella`` parent.
 VALID_MISSION_ROLES = {"gate", "umbrella"}
+VALID_MISSION_KINDS = {"probe", "test"}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -1102,6 +1103,10 @@ class Task:
     # ``umbrella``: this card is the mission's tracking parent (receives
     # the handoff comment). Ordinary tasks have None.
     role: Optional[str] = None
+    # Structured mission identity set only at creation. Probe/test missions
+    # are synthetic harness artifacts; cleanup still requires independent
+    # terminality proof before this marker can authorize archival.
+    mission_kind: Optional[str] = None
     # Force-loaded skills for the worker on this task (passed via
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
@@ -1217,6 +1222,9 @@ class Task:
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
             role=row["role"] if "role" in keys else None,
+            mission_kind=(
+                row["mission_kind"] if "mission_kind" in keys else None
+            ),
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             provider_override=(
@@ -1392,6 +1400,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- so a completed gate transitions to an explicit lifecycle handoff
     -- instead of silently stopping. Purely advisory to the dispatcher.
     role                 TEXT,
+    -- Structured synthetic-mission marker set at creation only. It is never
+    -- inferred from title/body/author and is never sufficient by itself to
+    -- authorize cleanup; terminality must still be proven from graph/run data.
+    mission_kind         TEXT,
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
@@ -2715,6 +2727,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # rows — they keep the pre-terminal-handoff behaviour (no observer
         # fires for them) until a card is explicitly tagged at creation.
         _add_column_if_missing(conn, "tasks", "role", "role TEXT")
+    if "mission_kind" not in cols:
+        _add_column_if_missing(conn, "tasks", "mission_kind", "mission_kind TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3221,6 +3235,7 @@ def create_task(
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     role: Optional[str] = None,
+    mission_kind: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3284,6 +3299,13 @@ def create_task(
             raise ValueError(
                 f"role must be one of {sorted(VALID_MISSION_ROLES)} or None, "
                 f"got {role!r}"
+            )
+    if mission_kind is not None:
+        mission_kind = str(mission_kind).strip().lower() or None
+        if mission_kind not in VALID_MISSION_KINDS:
+            raise ValueError(
+                f"mission_kind must be one of {sorted(VALID_MISSION_KINDS)} or None, "
+                f"got {mission_kind!r}"
             )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
@@ -3542,8 +3564,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, role
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, role, mission_kind
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3570,6 +3592,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         role,
+                        mission_kind,
                     ),
                 )
                 for pid in parents:
@@ -3598,6 +3621,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "mission_kind": mission_kind,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -5107,6 +5131,10 @@ def recompute_ready(
 HANDOFF_MARKER = "HERMES TERMINAL HANDOFF"
 HANDOFF_AUTHOR = "hotelos-cdp"
 HANDOFF_EVENT_KIND = "terminal_handoff"
+DEFAULT_TERMINAL_WATCHDOG_WINDOW_SECONDS = 120
+TERMINAL_PROBE_CLEANUP_EVENT_KIND = "terminal_probe_cleanup"
+DEFAULT_TERMINAL_PROBE_CLEANUP_LIMIT = 100
+TERMINAL_PROBE_DESCENDANT_LIMIT = 1000
 
 GATE_ACCEPTED_MARKERS = ("ACCEPT", "PASS")
 GATE_REJECTED_MARKERS = ("REJECT", "CHANGES REQUIRED", "FAIL", "NOT ACCEPTED")
@@ -6228,7 +6256,194 @@ def emit_terminal_handoffs_if_due(
     return emitted
 
 
-def watchdog_terminal_handoffs(conn: sqlite3.Connection, *, board=None) -> list[str]:
+def _terminal_probe_evidence(
+    conn: sqlite3.Connection,
+    umbrella: Task,
+    *,
+    window_seconds: int = DEFAULT_TERMINAL_WATCHDOG_WINDOW_SECONDS,
+    now: Optional[int] = None,
+) -> Optional[dict]:
+    """Return conservative persisted proof for a terminal probe/test mission.
+
+    A structured ``mission_kind`` or the legacy bookkeeping-only signature
+    establishes synthetic identity. Neither is sufficient alone: the complete
+    subtree must be terminal, contain a done/archived gate, have no executor
+    identity or live run, and have no post-terminality owner attention.
+    """
+    if umbrella.role != "umbrella" or umbrella.status != "done":
+        return None
+    rows = conn.execute(
+        "WITH RECURSIVE mission_tasks(id) AS ("
+        "  SELECT ? UNION "
+        "  SELECT l.child_id FROM task_links l "
+        "  JOIN mission_tasks m ON l.parent_id = m.id"
+        ") SELECT t.* FROM mission_tasks m JOIN tasks t ON t.id = m.id "
+        "ORDER BY t.id LIMIT ?",
+        (umbrella.id, TERMINAL_PROBE_DESCENDANT_LIMIT + 1),
+    ).fetchall()
+    if not rows or len(rows) > TERMINAL_PROBE_DESCENDANT_LIMIT:
+        return None
+    tasks = [Task.from_row(row) for row in rows]
+    if any(task.status not in {"done", "archived"} for task in tasks):
+        return None
+    if any(task.worker_pid is not None or task.current_run_id is not None for task in tasks):
+        return None
+    gates = [task for task in tasks if task.role == "gate"]
+    if not gates or any(task.status not in {"done", "archived"} for task in gates):
+        return None
+
+    task_ids = [task.id for task in tasks]
+    placeholders = ",".join("?" for _ in task_ids)
+    # Bookkeeping-only executor identity is required on the UMBRELLA's own
+    # runs (Product contract §2.2 legacy predicate): no profile, no worker
+    # pid, clean completed bookkeeping. Descendant runs must simply be
+    # terminal — a live run under a done card is a state anomaly that must
+    # never be archived around.
+    run_rows = conn.execute(
+        f"SELECT task_id, profile, worker_pid, status, outcome, ended_at "
+        f"FROM task_runs WHERE task_id IN ({placeholders})",
+        task_ids,
+    ).fetchall()
+    for run in run_rows:
+        if run["status"] != "done" or run["outcome"] != "completed":
+            return None
+        if run["ended_at"] is None:
+            return None
+        if run["task_id"] == umbrella.id and (
+            run["profile"] is not None or run["worker_pid"] is not None
+        ):
+            return None
+
+    # Legacy fixtures predate mission_kind. Their identity is intentionally
+    # narrow: unassigned umbrella plus bookkeeping-only runs. Never inspect
+    # title/body/author, which are forgeable prose.
+    identity_source: Optional[str] = None
+    if umbrella.mission_kind in VALID_MISSION_KINDS:
+        identity_source = "mission_kind"
+    elif umbrella.assignee is None:
+        identity_source = "legacy_derived"
+    if identity_source is None:
+        return None
+
+    completed = [int(task.completed_at) for task in tasks if task.completed_at is not None]
+    if len(completed) != len(tasks):
+        return None
+    terminal_at = max(completed)
+    comments = conn.execute(
+        f"SELECT author, body FROM task_comments WHERE task_id IN ({placeholders}) "
+        "AND created_at > ?",
+        (*task_ids, terminal_at),
+    ).fetchall()
+    if any(
+        not (
+            comment["author"] == HANDOFF_AUTHOR
+            and HANDOFF_MARKER in (comment["body"] or "")
+        )
+        for comment in comments
+    ):
+        return None
+    owner_event = conn.execute(
+        f"SELECT 1 FROM task_events WHERE task_id IN ({placeholders}) "
+        "AND created_at > ? AND kind IN "
+        "('blocked', 'unblocked', 'assigned', 'edited', "
+        " 'review_requested', 'changes_requested') LIMIT 1",
+        (*task_ids, terminal_at),
+    ).fetchone()
+    if owner_event is not None:
+        return None
+
+    latest_handoff = conn.execute(
+        "SELECT payload, created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (umbrella.id, HANDOFF_EVENT_KIND),
+    ).fetchone()
+    now_ts = int(time.time()) if now is None else int(now)
+    if latest_handoff and latest_handoff["payload"]:
+        try:
+            latest_payload = json.loads(latest_handoff["payload"]) or {}
+        except Exception:
+            return None
+        latest_decision = latest_payload.get("decision") or {}
+        if latest_decision.get("actionStatus") == ACTION_STATUS_STARTING:
+            window = max(0, int(window_seconds))
+            if now_ts - int(latest_handoff["created_at"]) < window:
+                return None
+
+    return {
+        "mission_kind": umbrella.mission_kind,
+        "identity_source": identity_source,
+        "terminal_at": terminal_at,
+        "gate_ids": [task.id for task in gates],
+        "task_count": len(tasks),
+    }
+
+
+def _archive_terminal_probe(
+    conn: sqlite3.Connection, umbrella: Task, evidence: dict,
+) -> bool:
+    """Journal ARCHIVE_READY then archive gates and umbrella without deletion."""
+    existing = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+        (umbrella.id, TERMINAL_PROBE_CLEANUP_EVENT_KIND),
+    ).fetchone()
+    if existing is None:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                umbrella.id,
+                TERMINAL_PROBE_CLEANUP_EVENT_KIND,
+                {
+                    "classification": DISCUSSION_ARCHIVE_READY,
+                    "reason": "probe_terminal",
+                    "evidence": evidence,
+                },
+            )
+    for gate_id in evidence.get("gate_ids") or []:
+        archive_task(conn, gate_id)
+    return archive_task(conn, umbrella.id)
+
+
+def cleanup_terminal_probe_missions(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = DEFAULT_TERMINAL_PROBE_CLEANUP_LIMIT,
+    window_seconds: int = DEFAULT_TERMINAL_WATCHDOG_WINDOW_SECONDS,
+    now: Optional[int] = None,
+) -> list[str]:
+    """Archive a bounded batch of proven-terminal probe/test umbrellas.
+
+    The routine is fail-closed and idempotent. It calls ``archive_task`` only;
+    generic done descendants remain untouched and all DB history is preserved.
+    """
+    archived: list[str] = []
+    batch_limit = max(0, int(limit))
+    if batch_limit == 0:
+        return archived
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE role = 'umbrella' AND status = 'done' "
+        "ORDER BY completed_at, id LIMIT ?",
+        (batch_limit,),
+    ).fetchall()
+    for row in rows:
+        umbrella = Task.from_row(row)
+        evidence = _terminal_probe_evidence(
+            conn,
+            umbrella,
+            window_seconds=window_seconds,
+            now=now,
+        )
+        if evidence and _archive_terminal_probe(conn, umbrella, evidence):
+            archived.append(umbrella.id)
+    return archived
+
+
+def watchdog_terminal_handoffs(
+    conn: sqlite3.Connection,
+    *,
+    board=None,
+    window_seconds: int = DEFAULT_TERMINAL_WATCHDOG_WINDOW_SECONDS,
+    now: Optional[int] = None,
+) -> list[str]:
     """Correct persisted STARTING auto-continuations that never gained a
     live execution run/witness/heartbeat.
 
@@ -6237,9 +6452,17 @@ def watchdog_terminal_handoffs(conn: sqlite3.Connection, *, board=None) -> list[
     witness (if any) must point at a ``task_runs`` row that is still running
     with an unexpired claim; a run that completed is real materialization
     (not the watchdog's job). Anything else — missing witness, missing run,
-    crashed/failed/ended run, expired claim — is a stuck claim: the watchdog
-    appends a corrective comment + ``terminal_handoff_watchdog`` event
-    flipping the persisted decision to APPROVAL_REQUIRED / AWAITING_APPROVAL.
+    crashed/failed/ended run, expired claim — is a stuck claim. A STARTING
+    handoff is bounded: the watchdog does not act until
+    ``now - handoff.created_at >= window_seconds`` (default 120s ~= two 60s
+    dispatch ticks) so a freshly-spawned executor gets a full window to claim
+    and heartbeat before classification. After the window a proven-terminal
+    probe/test mission is auto-archived; anything else receives a corrective
+    comment + ``terminal_handoff_watchdog`` event and a RE-EMITTED
+    ``terminal_handoff`` (``recomputed=true``, keyed by
+    ``recomputed_from_handoff_event_id``) flipping the persisted decision to
+    APPROVAL_REQUIRED / AWAITING_APPROVAL so every read model — Mission
+    Control included — observes the same state.
 
     Idempotent: exactly one correction per handoff event (keyed by the
     ``handoff_event_id`` in the watchdog payload), so repeated dispatch ticks
@@ -6255,7 +6478,7 @@ def watchdog_terminal_handoffs(conn: sqlite3.Connection, *, board=None) -> list[
     for row in rows:
         task_id = row["task_id"]
         ev = conn.execute(
-            "SELECT id, payload FROM task_events WHERE id = ?",
+            "SELECT id, payload, created_at FROM task_events WHERE id = ?",
             (int(row["eid"]),),
         ).fetchone()
         if not ev or not ev["payload"]:
@@ -6267,6 +6490,16 @@ def watchdog_terminal_handoffs(conn: sqlite3.Connection, *, board=None) -> list[
         payload = payload or {}
         decision = payload.get("decision") or {}
         if decision.get("actionStatus") != ACTION_STATUS_STARTING:
+            continue
+        mission_task = get_task(conn, task_id)
+        if mission_task is None or mission_task.status == "archived":
+            continue
+        now_ts = int(time.time()) if now is None else int(now)
+        window = max(0, int(window_seconds))
+        if now_ts - int(ev["created_at"]) < window:
+            # STARTING is a bounded transitional state. Give a newly-spawned
+            # executor one complete configured window to claim and heartbeat
+            # before treating the handoff as stale.
             continue
         witness = _execution_witness_for(conn, payload.get("execution"))
         if witness and witness.get("outcome") == "completed":
@@ -6291,6 +6524,17 @@ def watchdog_terminal_handoffs(conn: sqlite3.Connection, *, board=None) -> list[
                 already_corrected = True
                 break
         if already_corrected:
+            continue
+        probe_evidence = _terminal_probe_evidence(
+            conn,
+            mission_task,
+            window_seconds=window,
+            now=now_ts,
+        )
+        if probe_evidence is not None and _archive_terminal_probe(
+            conn, mission_task, probe_evidence
+        ):
+            corrected.append(task_id)
             continue
         action_type = (
             decision.get("actionType") or decision.get("type") or "AUTO_ACTION"
@@ -6341,6 +6585,32 @@ def watchdog_terminal_handoffs(conn: sqlite3.Connection, *, board=None) -> list[
             f"{APPROVAL_REQUIRED} / {ACTION_STATUS_AWAITING_APPROVAL}. "
             f"{reason}"
         )
+        corrected_payload = dict(payload)
+        corrected_decision = dict(decision)
+        corrected_decision.update(
+            {
+                "decisionClass": APPROVAL_REQUIRED,
+                "requiresApproval": True,
+                "actionStatus": ACTION_STATUS_AWAITING_APPROVAL,
+                "ownerAction": "REQUIRED",
+                "failClosedToApproval": True,
+            }
+        )
+        corrected_next_action = dict(payload.get("next_action") or {})
+        corrected_next_action["requiresApproval"] = True
+        corrected_payload.update(
+            {
+                "next_action": corrected_next_action,
+                "decision": corrected_decision,
+                "discussion": discussion,
+                "autoContinue": False,
+                "recomputed": True,
+                "recomputed_from_handoff_event_id": handoff_event_id,
+                "ownerAction": "REQUIRED",
+                "actionStatus": ACTION_STATUS_AWAITING_APPROVAL,
+                "lastActivity": now_ts,
+            }
+        )
         with write_txn(conn):
             add_comment(conn, task_id, HANDOFF_AUTHOR, comment_body)
             _append_event(
@@ -6361,6 +6631,12 @@ def watchdog_terminal_handoffs(conn: sqlite3.Connection, *, board=None) -> list[
                     "reason": reason,
                     "autoContinue": False,
                 },
+            )
+            # Mission Control reads the newest canonical terminal_handoff,
+            # not the watchdog's audit event. Re-emit the corrected decision
+            # so every read model observes the same persisted state.
+            _append_event(
+                conn, task_id, HANDOFF_EVENT_KIND, corrected_payload,
             )
         corrected.append(task_id)
     return corrected

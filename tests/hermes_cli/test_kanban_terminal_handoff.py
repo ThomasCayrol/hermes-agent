@@ -956,9 +956,18 @@ def test_watchdog_corrects_starting_without_witness_and_is_idempotent(conn):
         verdict_result="REJECT",
         verdict_summary="QA rejected: changes required.",
     )
+    conn.execute(
+        "UPDATE tasks SET assignee = 'hotelos-lead' WHERE id = ?", (umbrella,)
+    )
     _plant_legacy_starting_handoff(conn, umbrella, gate)
+    planted_at = conn.execute(
+        "SELECT created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1", (umbrella, kb.HANDOFF_EVENT_KIND)
+    ).fetchone()[0]
 
-    corrected = kb.watchdog_terminal_handoffs(conn)
+    corrected = kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted_at) + 120
+    )
     assert corrected == [umbrella]
 
     bodies = _handoff_comment_bodies(conn, umbrella)
@@ -986,7 +995,9 @@ def test_watchdog_corrects_starting_without_witness_and_is_idempotent(conn):
     assert "Action du propriétaire requise" in payload["discussion"]["action"]
 
     # Idempotent: the same STARTING handoff is never corrected twice.
-    assert kb.watchdog_terminal_handoffs(conn) == []
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted_at) + 240
+    ) == []
     assert len(_watchdog_events(conn, umbrella)) == 1
 
 
@@ -1006,6 +1017,13 @@ def test_watchdog_skips_starting_with_live_execution_witness(conn):
     ) is True
 
     assert kb.watchdog_terminal_handoffs(conn) == []
+    # Even after the full watchdog window, the live executor run is real
+    # materialization: STARTING stays current and is never corrected.
+    import time
+
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(time.time()) + 120
+    ) == []
     assert _watchdog_events(conn, umbrella) == []
     assert len(_handoff_comment_bodies(conn, umbrella)) == 1
 
@@ -1035,14 +1053,18 @@ def test_watchdog_corrects_starting_whose_executor_run_died(conn):
             (int(time.time()), witness["run_id"]),
         )
 
-    corrected = kb.watchdog_terminal_handoffs(conn)
+    corrected = kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(time.time()) + 120
+    )
     assert corrected == [umbrella]
     events = _watchdog_events(conn, umbrella)
     assert len(events) == 1
     payload = json.loads(events[0]["payload"])
     assert payload["reason"]
     assert payload["to"]["decisionClass"] == kb.APPROVAL_REQUIRED
-    assert kb.watchdog_terminal_handoffs(conn) == []
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(time.time()) + 240
+    ) == []
 
 
 # -- reconciliation: derived Git fields / structured truth (2026-09-04) -----
@@ -1610,3 +1632,227 @@ def test_discussion_no_false_archive_when_descendant_runs_cleanly_ended(conn):
     assert snapshot["active_workers"] == []
     assert snapshot["pending_work"] == []
     assert discussion["status"] == kb.DISCUSSION_ARCHIVE_READY
+
+
+# -- terminal probe/test lifecycle cleanup ---------------------------------
+
+
+def test_mission_kind_is_structured_and_validated_at_creation(conn):
+    probe = kb.create_task(
+        conn, title="Synthetic lifecycle fixture", role="umbrella", mission_kind="probe"
+    )
+    test = kb.create_task(
+        conn, title="Synthetic test fixture", role="umbrella", mission_kind="TEST"
+    )
+
+    assert kb.get_task(conn, probe).mission_kind == "probe"
+    assert kb.get_task(conn, test).mission_kind == "test"
+    with pytest.raises(ValueError, match="mission_kind"):
+        kb.create_task(
+            conn, title="Not a probe", role="umbrella", mission_kind="synthetic"
+        )
+
+
+def test_watchdog_waits_full_window_then_reemits_corrected_handoff(conn):
+    umbrella, gate = _run_mission(
+        conn,
+        verdict_result="REJECT",
+        verdict_summary="QA rejected: changes required.",
+    )
+    conn.execute(
+        "UPDATE tasks SET assignee = 'hotelos-lead' WHERE id = ?", (umbrella,)
+    )
+    _plant_legacy_starting_handoff(conn, umbrella, gate)
+    planted = conn.execute(
+        "SELECT id, created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (umbrella, kb.HANDOFF_EVENT_KIND),
+    ).fetchone()
+
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted["created_at"]) + 119
+    ) == []
+    assert _newest_handoff_event_payload(conn, umbrella)["decision"][
+        "actionStatus"
+    ] == kb.ACTION_STATUS_STARTING
+
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted["created_at"]) + 120
+    ) == [umbrella]
+    corrected = _newest_handoff_event_payload(conn, umbrella)
+    assert corrected["recomputed"] is True
+    assert corrected["recomputed_from_handoff_event_id"] == int(planted["id"])
+    assert corrected["decision"]["decisionClass"] == kb.APPROVAL_REQUIRED
+    assert corrected["decision"]["actionStatus"] == kb.ACTION_STATUS_AWAITING_APPROVAL
+    assert kb.get_task(conn, umbrella).status == "done"
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted["created_at"]) + 240
+    ) == []
+
+
+def test_terminal_probe_auto_archive_preserves_history_and_is_idempotent(conn):
+    umbrella = kb.create_task(
+        conn, title="Synthetic fixture", role="umbrella", mission_kind="probe"
+    )
+    gate = kb.create_task(
+        conn, title="Fixture gate", role="gate", parents=[umbrella]
+    )
+    generic = kb.create_task(
+        conn, title="Corrective remediation", parents=[umbrella]
+    )
+    assert kb.claim_task(conn, umbrella) is not None
+    assert kb.complete_task(conn, umbrella, result="fixture complete")
+    assert kb.claim_task(conn, gate) is not None
+    assert kb.complete_task(conn, gate, result="ACCEPTED", summary="All checks green.")
+    assert kb.claim_task(conn, generic) is not None
+    assert kb.complete_task(conn, generic, result="done")
+    assert kb.emit_terminal_handoffs_if_due(conn) == [gate]
+
+    before = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("task_runs", "task_comments", "task_links")
+    }
+    assert kb.cleanup_terminal_probe_missions(conn) == [umbrella]
+    assert kb.get_task(conn, umbrella).status == "archived"
+    assert kb.get_task(conn, gate).status == "archived"
+    assert kb.get_task(conn, generic).status == "done"
+    assert conn.execute(
+        "SELECT id FROM tasks WHERE role = 'umbrella' AND status != 'archived' "
+        "AND id = ?", (umbrella,)
+    ).fetchone() is None
+    after = {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("task_runs", "task_comments", "task_links")
+    }
+    assert after == before
+    archived_events = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = 'archived' "
+        "AND task_id IN (?, ?)", (umbrella, gate)
+    ).fetchone()[0]
+    assert archived_events == 2
+
+    assert kb.cleanup_terminal_probe_missions(conn) == []
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = 'archived' "
+        "AND task_id IN (?, ?)", (umbrella, gate)
+    ).fetchone()[0] == archived_events
+
+
+def test_stale_starting_probe_waits_then_archives_in_watchdog_tick(conn):
+    umbrella = kb.create_task(
+        conn, title="Synthetic rejected fixture", role="umbrella", mission_kind="test"
+    )
+    gate = kb.create_task(
+        conn, title="Fixture gate", role="gate", parents=[umbrella]
+    )
+    assert kb.claim_task(conn, umbrella) is not None
+    assert kb.complete_task(conn, umbrella, result="fixture complete")
+    assert kb.claim_task(conn, gate) is not None
+    assert kb.complete_task(
+        conn, gate, result="REJECT", summary="QA rejected: changes required."
+    )
+    _plant_legacy_starting_handoff(conn, umbrella, gate)
+    planted_at = conn.execute(
+        "SELECT created_at FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1", (umbrella, kb.HANDOFF_EVENT_KIND)
+    ).fetchone()[0]
+
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted_at) + 119
+    ) == []
+    assert kb.get_task(conn, umbrella).status == "done"
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted_at) + 120
+    ) == [umbrella]
+    assert kb.get_task(conn, umbrella).status == "archived"
+    assert kb.get_task(conn, gate).status == "archived"
+    lifecycle = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+        (umbrella, kb.TERMINAL_PROBE_CLEANUP_EVENT_KIND),
+    ).fetchall()
+    assert len(lifecycle) == 1
+    assert json.loads(lifecycle[0]["payload"])["classification"] == (
+        kb.DISCUSSION_ARCHIVE_READY
+    )
+    assert _watchdog_events(conn, umbrella) == []
+    assert kb.watchdog_terminal_handoffs(
+        conn, window_seconds=120, now=int(planted_at) + 240
+    ) == []
+
+
+def test_cleanup_archives_legacy_probe_but_not_real_or_owner_attended_missions(conn):
+    legacy, legacy_gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+
+    real, real_gate = _run_mission(
+        conn,
+        verdict_result="ACCEPTED",
+        verdict_summary="All checks green.",
+    )
+    conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", ("hotelos-lead", real))
+
+    attended = kb.create_task(
+        conn, title="Attended fixture", role="umbrella", mission_kind="probe"
+    )
+    attended_gate = kb.create_task(
+        conn, title="Attended gate", role="gate", parents=[attended]
+    )
+    assert kb.claim_task(conn, attended) is not None
+    assert kb.complete_task(conn, attended, result="fixture complete")
+    assert kb.claim_task(conn, attended_gate) is not None
+    assert kb.complete_task(
+        conn, attended_gate, result="ACCEPTED", summary="All checks green."
+    )
+    terminal_at = max(
+        kb.get_task(conn, attended).completed_at,
+        kb.get_task(conn, attended_gate).completed_at,
+    )
+    comment_id = kb.add_comment(
+        conn, attended, "user", "Keep this synthetic mission for manual review."
+    )
+    conn.execute(
+        "UPDATE task_comments SET created_at = ? WHERE id = ?",
+        (int(terminal_at) + 1, comment_id),
+    )
+
+    assert kb.cleanup_terminal_probe_missions(conn, now=int(terminal_at) + 2) == [legacy]
+    assert kb.get_task(conn, legacy).status == "archived"
+    assert kb.get_task(conn, legacy_gate).status == "archived"
+    assert kb.get_task(conn, real).status == "done"
+    assert kb.get_task(conn, real_gate).status == "done"
+    assert kb.get_task(conn, attended).status == "done"
+    assert kb.get_task(conn, attended_gate).status == "done"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = 'archived' "
+        "AND task_id IN (?, ?, ?, ?)",
+        (real, real_gate, attended, attended_gate),
+    ).fetchone()[0] == 0
+
+
+def test_cleanup_never_archives_mission_with_active_live_descendant(conn):
+    umbrella = kb.create_task(
+        conn, title="Synthetic fixture", role="umbrella", mission_kind="test"
+    )
+    gate = kb.create_task(
+        conn, title="Fixture gate", role="gate", parents=[umbrella]
+    )
+    live = kb.create_task(
+        conn, title="Remediation worker", assignee="hotelos-lead", parents=[umbrella]
+    )
+    assert kb.claim_task(conn, umbrella) is not None
+    assert kb.complete_task(conn, umbrella, result="fixture complete")
+    assert kb.claim_task(conn, gate) is not None
+    assert kb.complete_task(conn, gate, result="ACCEPTED", summary="All checks green.")
+    claimed = kb.claim_task(conn, live)
+    assert claimed is not None and claimed.status == "running"
+    assert kb.get_task(conn, umbrella).status == "done"
+
+    assert kb.cleanup_terminal_probe_missions(conn) == []
+    assert kb.get_task(conn, umbrella).status == "done"
+    assert kb.get_task(conn, gate).status == "done"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = 'archived'"
+    ).fetchone()[0] == 0
